@@ -1,10 +1,10 @@
 # ingress-operator
 Ingress operator is a way to transition from `nginx-ingress` to `nginx-fabric` and use `Gateway` and `Httproute` resources instead of `Ingress`.
 
-Check-out [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway) too.
+Check [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway) out too.
 
 The difference is that this operator will transparently create new resources. Those can of course be retrieved from Kubernetes and put into source control
-so you can think of this tool like Ingress2Gateway with an extra step.
+so you can use this tool like Ingress2Gateway with an extra step.
 But the real benefit comes from changing the stuff over which you do not have direct control, for instance a
 new `Ingress` resource might be provisioned automatically and you cannot change that simply. At the same
 time you cannot run `nginx-ingress` controller anymore as most of the infrastructure is already migrated.
@@ -19,6 +19,7 @@ Nginx instance(s) which is consistent with previous `nginx-ingress` behaviour. O
 ## Build
 
 ```bash
+nix-shell -p operator-sdk kubebuilder
 CGO_ENABLED=0 go build -o bin/manager ./cmd/main.go
 ```
 

@@ -57,11 +57,6 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
-		By("creating gateway namespace")
-		cmd = exec.Command("kubectl", "create", "ns", "nginx-fabric")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create gateway namespace")
-
 		By("labeling the namespace to enforce the restricted security policy")
 		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
 			"pod-security.kubernetes.io/enforce=restricted")
@@ -92,10 +87,6 @@ var _ = Describe("Manager", Ordered, func() {
 
 		By("uninstalling CRDs")
 		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing gateway namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", "nginx-fabric")
 		_, _ = utils.Run(cmd)
 
 		By("removing manager namespace")

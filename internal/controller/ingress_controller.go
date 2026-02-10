@@ -228,8 +228,8 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 
 	if !r.EnableDeletion {
 		// Deletion is disabled, just remove finalizer
-		if containsString(ingress.ObjectMeta.Finalizers, FinalizerName) {
-			ingress.ObjectMeta.Finalizers = removeString(ingress.ObjectMeta.Finalizers, FinalizerName)
+		if containsString(ingress.Finalizers, FinalizerName) {
+			ingress.Finalizers = removeString(ingress.Finalizers, FinalizerName)
 			if err := r.Update(ctx, ingress); err != nil {
 				logger.Error(err, "failed to remove finalizer")
 				return ctrl.Result{}, err
@@ -293,8 +293,8 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 	// Note: In shared gateway mode, we don't delete the Gateway as other Ingresses may be using it
 
 	// Remove finalizer
-	if containsString(ingress.ObjectMeta.Finalizers, FinalizerName) {
-		ingress.ObjectMeta.Finalizers = removeString(ingress.ObjectMeta.Finalizers, FinalizerName)
+	if containsString(ingress.Finalizers, FinalizerName) {
+		ingress.Finalizers = removeString(ingress.Finalizers, FinalizerName)
 		if err := r.Update(ctx, ingress); err != nil {
 			logger.Error(err, "failed to remove finalizer")
 			return ctrl.Result{}, err
