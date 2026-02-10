@@ -120,7 +120,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Check if this Ingress should be ignored
-	if ingress.Annotations != nil && ingress.Annotations[IgnoreIngressAnnotation] == "true" {
+	if ingress.Annotations != nil && ingress.Annotations[IgnoreIngressAnnotation] == fmt.Sprintf("%t", true) {
 		logger.Info("Ingress has ignore annotation, skipping reconciliation")
 		return ctrl.Result{}, nil
 	}
@@ -385,14 +385,14 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 	logger := log.FromContext(ctx)
 
 	// Check if already disabled
-	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == "true" {
+	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == fmt.Sprintf("%t", true) {
 		return nil // Already disabled
 	}
 
 	modified := false
 
 	// Save original ingressClassName if it exists
-	if ingress.Spec.IngressClassName != nil && *ingress.Spec.IngressClassName != "" {
+	if ingress.Spec.IngressClassName != nil && *ingress.Spec.IngressClassName != fmt.Sprintf("%t", true) {
 		if ingress.Annotations == nil {
 			ingress.Annotations = make(map[string]string)
 		}
@@ -427,7 +427,7 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 		if ingress.Annotations == nil {
 			ingress.Annotations = make(map[string]string)
 		}
-		ingress.Annotations[IngressDisabledAnnotation] = "true"
+		ingress.Annotations[IngressDisabledAnnotation] = fmt.Sprintf("%t", true)
 
 		if err := r.Update(ctx, ingress); err != nil {
 			return fmt.Errorf("failed to update Ingress to disable it: %w", err)

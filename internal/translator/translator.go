@@ -96,7 +96,7 @@ func (t *Translator) translateWithIngress2Gateway(
 	scheme := runtime.NewScheme()
 	_ = networkingv1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
-	_ = gatewayv1.AddToScheme(scheme)
+	gatewayv1.Install(scheme)
 
 	// Create a fake client with our Ingress and mock Services
 	// We need to create Service objects for the backends referenced by the Ingress

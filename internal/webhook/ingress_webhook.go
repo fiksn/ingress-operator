@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright Gregor Pogacnik 2026.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	networkingv1 "k8s.io/api/networking/v1"
@@ -57,14 +58,14 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 	}
 
 	// Check if this Ingress should be ignored (skip all processing)
-	if ingress.Annotations != nil && ingress.Annotations[IgnoreIngressAnnotation] == "true" {
+	if ingress.Annotations != nil && ingress.Annotations[IgnoreIngressAnnotation] == fmt.Sprintf("%t", true) {
 		logger.Info("Ingress has ignore annotation, skipping mutation")
 		return admission.Allowed("ignored")
 	}
 
 	// Check if this Ingress should be allowed to be created (for compatibility)
 	allowIngress := false
-	if ingress.Annotations != nil && ingress.Annotations[AllowIngressAnnotation] == "true" {
+	if ingress.Annotations != nil && ingress.Annotations[AllowIngressAnnotation] == fmt.Sprintf("%t", true) {
 		allowIngress = true
 		logger.Info("Ingress has allow annotation, will permit creation after translation")
 	}
@@ -117,7 +118,7 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 	if ingress.Annotations == nil {
 		ingress.Annotations = make(map[string]string)
 	}
-	ingress.Annotations[WebhookAnnotation] = "true"
+	ingress.Annotations[WebhookAnnotation] = fmt.Sprintf("%t", true)
 
 	// Marshal the modified ingress
 	marshaledIngress, err := json.Marshal(ingress)
