@@ -96,6 +96,7 @@ func main() {
 	var private bool
 	var privateAnnotations string
 	var privateIngressClassPattern string
+	var ingressClassFilter string
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "nginx-fabric",
 		"The namespace where the Gateway resource will be created")
 	flag.StringVar(&gatewayName, "gateway-name", "ingress-gateway",
@@ -104,6 +105,8 @@ func main() {
 		"The GatewayClass to use for created Gateway resources")
 	flag.StringVar(&watchNamespace, "watch-namespace", "",
 		"If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
+	flag.StringVar(&ingressClassFilter, "ingress-class-filter", "*",
+		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). Default '*' processes all classes.")
 	flag.BoolVar(&oneGatewayPerIngress, "one-gateway-per-ingress", false,
 		"If true, create a separate Gateway for each Ingress with the same name")
 	flag.BoolVar(&enableDeletion, "enable-deletion", false,
@@ -330,6 +333,7 @@ func main() {
 		PrivateInfrastructureAnnotations: privateInfraAnnotations,
 		ApplyPrivateToAll:                private,
 		PrivateIngressClassPattern:       privateIngressClassPattern,
+		IngressClassFilter:               ingressClassFilter,
 		UseIngress2Gateway:               useIngress2Gateway,
 		Ingress2GatewayProvider:          ingress2GatewayProvider,
 		Ingress2GatewayIngressClass:      ingress2GatewayIngressClass,

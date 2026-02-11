@@ -19,7 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,6 +44,7 @@ const (
 	OriginalIngressClassAnnotation     = "ingress-operator.fiction.si/original-ingress-class"
 	OriginalIngressClassNameAnnotation = "ingress-operator.fiction.si/original-ingress-classname"
 	FinalizerName                      = "ingress-operator.fiction.si/finalizer"
+	MaxHTTPRouteRules                  = 16 // Gateway API limit
 	DefaultGatewayAnnotationFilters    = "ingress.kubernetes.io,cert-manager.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-operator.fiction.si"
@@ -69,6 +72,7 @@ type IngressReconciler struct {
 	PrivateInfrastructureAnnotations map[string]string
 	ApplyPrivateToAll                bool
 	PrivateIngressClassPattern       string
+	IngressClassFilter               string
 	UseIngress2Gateway               bool
 	Ingress2GatewayProvider          string
 	Ingress2GatewayIngressClass      string
@@ -118,6 +122,15 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Check if this Ingress should be ignored
 	if ingress.Annotations != nil && ingress.Annotations[IgnoreIngressAnnotation] == fmt.Sprintf("%t", true) {
 		logger.Info("Ingress has ignore annotation, skipping reconciliation")
+		return ctrl.Result{}, nil
+	}
+
+	// Check if this Ingress matches the ingress class filter
+	if !r.matchesIngressClassFilter(&ingress) {
+		ingressClass := r.getIngressClass(&ingress)
+		logger.Info("Ingress class does not match filter, skipping reconciliation",
+			"ingressClass", ingressClass,
+			"filter", r.IngressClassFilter)
 		return ctrl.Result{}, nil
 	}
 
@@ -206,6 +219,12 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 			logger.Info("Gateway applied successfully", "namespace", gateway.Namespace, "name", gateway.Name)
 		}
 
+		// Resolve any named ports before applying
+		if err := r.resolveNamedPorts(ctx, &ingress, httpRoute); err != nil {
+			logger.Error(err, "failed to resolve named ports")
+			// Continue anyway with fallback ports
+		}
+
 		// Create HTTPRoute
 		if err := r.applyHTTPRouteIfManaged(ctx, httpRoute); err != nil {
 			logger.Error(err, "failed to apply HTTPRoute")
@@ -279,9 +298,22 @@ func (r *IngressReconciler) reconcileSharedGateways(
 			classTrans := translator.New(transConfig)
 
 			httpRoute := classTrans.TranslateToHTTPRoute(&ingress)
-			if err := r.applyHTTPRouteIfManaged(ctx, httpRoute); err != nil {
-				logger.Error(err, "failed to apply HTTPRoute")
-				continue
+
+			// Resolve any named ports before applying
+			if err := r.resolveNamedPorts(ctx, &ingress, httpRoute); err != nil {
+				logger.Error(err, "failed to resolve named ports")
+				// Continue anyway with fallback ports
+			}
+
+			// Split HTTPRoute if it exceeds the Gateway API limit
+			httpRoutes := r.splitHTTPRouteIfNeeded(httpRoute)
+
+			// Apply all HTTPRoute(s)
+			for _, hr := range httpRoutes {
+				if err := r.applyHTTPRouteIfManaged(ctx, hr); err != nil {
+					logger.Error(err, "failed to apply HTTPRoute")
+					continue
+				}
 			}
 		}
 	}
@@ -492,6 +524,179 @@ func (r *IngressReconciler) getGatewayNameForClass(ingressClass string) string {
 		return r.GatewayName
 	}
 	return ingressClass
+}
+
+// getIngressClass returns the ingress class from spec.ingressClassName or the legacy annotation
+func (r *IngressReconciler) getIngressClass(ingress *networkingv1.Ingress) string {
+	// First check spec.ingressClassName
+	if ingress.Spec.IngressClassName != nil && *ingress.Spec.IngressClassName != "" {
+		return *ingress.Spec.IngressClassName
+	}
+
+	// Fallback to legacy annotation
+	if ingress.Annotations != nil {
+		if class, ok := ingress.Annotations[IngressClassAnnotation]; ok && class != "" {
+			return class
+		}
+	}
+
+	return ""
+}
+
+// resolveNamedPorts resolves named ports in HTTPRoute by looking up the actual Services
+func (r *IngressReconciler) resolveNamedPorts(ctx context.Context, ingress *networkingv1.Ingress, httpRoute *gatewayv1.HTTPRoute) error {
+	logger := log.FromContext(ctx)
+
+	for i := range httpRoute.Spec.Rules {
+		for j := range httpRoute.Spec.Rules[i].BackendRefs {
+			backendRef := &httpRoute.Spec.Rules[i].BackendRefs[j]
+
+			// Check if port is 0 (indicates named port)
+			if backendRef.Port != nil && *backendRef.Port == 0 {
+				serviceName := string(backendRef.Name)
+
+				// Find the named port from the Ingress spec
+				portName := r.findPortNameInIngress(ingress, serviceName)
+				if portName == "" {
+					logger.Info("Could not find port name in Ingress for service, using fallback port 80",
+						"service", serviceName,
+						"namespace", ingress.Namespace)
+					fallbackPort := int32(80)
+					backendRef.Port = &fallbackPort
+					continue
+				}
+
+				// Look up the Service to resolve the named port
+				resolvedPort, err := r.resolveServicePort(ctx, ingress.Namespace, serviceName, portName)
+				if err != nil {
+					logger.Info("Could not resolve named port from Service, using fallback port 80",
+						"service", serviceName,
+						"portName", portName,
+						"namespace", ingress.Namespace,
+						"error", err.Error())
+					fallbackPort := int32(80)
+					backendRef.Port = &fallbackPort
+					continue
+				}
+
+				logger.Info("Resolved named port from Service",
+					"service", serviceName,
+					"portName", portName,
+					"resolvedPort", resolvedPort,
+					"namespace", ingress.Namespace)
+				backendRef.Port = &resolvedPort
+			}
+		}
+	}
+
+	return nil
+}
+
+// findPortNameInIngress finds the port name for a given service in the Ingress spec
+func (r *IngressReconciler) findPortNameInIngress(ingress *networkingv1.Ingress, serviceName string) string {
+	for _, rule := range ingress.Spec.Rules {
+		if rule.HTTP != nil {
+			for _, path := range rule.HTTP.Paths {
+				if path.Backend.Service != nil && path.Backend.Service.Name == serviceName {
+					return path.Backend.Service.Port.Name
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// resolveServicePort looks up a Service and resolves a named port to its numeric value
+func (r *IngressReconciler) resolveServicePort(ctx context.Context, namespace, serviceName, portName string) (int32, error) {
+	var service corev1.Service
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: namespace,
+		Name:      serviceName,
+	}, &service)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get Service: %w", err)
+	}
+
+	// Find the port by name
+	for _, port := range service.Spec.Ports {
+		if port.Name == portName {
+			return port.Port, nil
+		}
+	}
+
+	return 0, fmt.Errorf("port %s not found in Service %s", portName, serviceName)
+}
+
+// matchesIngressClassFilter checks if the Ingress class matches the configured filter pattern
+func (r *IngressReconciler) matchesIngressClassFilter(ingress *networkingv1.Ingress) bool {
+	// Default filter "*" matches everything
+	if r.IngressClassFilter == "" || r.IngressClassFilter == "*" {
+		return true
+	}
+
+	ingressClass := r.getIngressClass(ingress)
+
+	// Empty ingress class matches empty filter or "*"
+	if ingressClass == "" {
+		return r.IngressClassFilter == "" || r.IngressClassFilter == "*"
+	}
+
+	// Use filepath.Match for glob pattern matching
+	matched, err := filepath.Match(r.IngressClassFilter, ingressClass)
+	if err != nil {
+		// If pattern is invalid, log error and don't match
+		log.Log.Error(err, "Invalid ingress class filter pattern", "pattern", r.IngressClassFilter)
+		return false
+	}
+
+	return matched
+}
+
+// splitHTTPRouteIfNeeded splits an HTTPRoute into multiple routes if it exceeds the Gateway API limit
+func (r *IngressReconciler) splitHTTPRouteIfNeeded(httpRoute *gatewayv1.HTTPRoute) []*gatewayv1.HTTPRoute {
+	// If the HTTPRoute has <= MaxHTTPRouteRules, no split needed
+	if len(httpRoute.Spec.Rules) <= MaxHTTPRouteRules {
+		return []*gatewayv1.HTTPRoute{httpRoute}
+	}
+
+	logger := log.Log.WithName("splitHTTPRouteIfNeeded")
+	logger.Info("HTTPRoute exceeds max rules, splitting",
+		"name", httpRoute.Name,
+		"namespace", httpRoute.Namespace,
+		"totalRules", len(httpRoute.Spec.Rules),
+		"maxRules", MaxHTTPRouteRules)
+
+	// Split into multiple HTTPRoutes
+	var result []*gatewayv1.HTTPRoute
+	rules := httpRoute.Spec.Rules
+	partNum := 1
+
+	for i := 0; i < len(rules); i += MaxHTTPRouteRules {
+		end := i + MaxHTTPRouteRules
+		if end > len(rules) {
+			end = len(rules)
+		}
+
+		// Create a copy of the HTTPRoute for this chunk
+		part := httpRoute.DeepCopy()
+		part.Spec.Rules = rules[i:end]
+
+		// Update the name with a suffix (except for the first part to maintain compatibility)
+		if partNum > 1 {
+			part.Name = fmt.Sprintf("%s-part-%d", httpRoute.Name, partNum)
+		}
+
+		logger.Info("Created HTTPRoute part",
+			"originalName", httpRoute.Name,
+			"partName", part.Name,
+			"partNum", partNum,
+			"rulesInPart", len(part.Spec.Rules))
+
+		result = append(result, part)
+		partNum++
+	}
+
+	return result
 }
 
 func (r *IngressReconciler) applyHTTPRouteIfManaged(ctx context.Context, httpRoute *gatewayv1.HTTPRoute) error {

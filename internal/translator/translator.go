@@ -264,14 +264,24 @@ func (t *Translator) extractServicesFromIngress(ingress *networkingv1.Ingress) [
 								Namespace: ingress.Namespace,
 							},
 							Spec: corev1.ServiceSpec{
-								Ports: []corev1.ServicePort{
-									{
-										Port: path.Backend.Service.Port.Number,
-										Name: fmt.Sprintf("port-%d", path.Backend.Service.Port.Number),
-									},
-								},
+								Ports: []corev1.ServicePort{},
 							},
 						}
+
+						// Add service port based on whether it's numeric or named
+						if path.Backend.Service.Port.Number > 0 {
+							svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{
+								Port: path.Backend.Service.Port.Number,
+								Name: fmt.Sprintf("port-%d", path.Backend.Service.Port.Number),
+							})
+						} else if path.Backend.Service.Port.Name != "" {
+							// Named port - use port 80 as default for mock Service
+							svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{
+								Port: 80, // Default port for mock Service
+								Name: path.Backend.Service.Port.Name,
+							})
+						}
+
 						serviceMap[svcName] = svc
 					}
 				}
@@ -657,15 +667,26 @@ func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewa
 				var backendRefs []gatewayv1.HTTPBackendRef
 
 				if path.Backend.Service != nil {
-					port := path.Backend.Service.Port.Number
 					backendRef := gatewayv1.HTTPBackendRef{
 						BackendRef: gatewayv1.BackendRef{
 							BackendObjectReference: gatewayv1.BackendObjectReference{
 								Name: gatewayv1.ObjectName(path.Backend.Service.Name),
-								Port: &port,
 							},
 						},
 					}
+
+					// Handle port - can be either number or name
+					if path.Backend.Service.Port.Number > 0 {
+						// Use numeric port
+						port := path.Backend.Service.Port.Number
+						backendRef.BackendRef.BackendObjectReference.Port = &port
+					} else if path.Backend.Service.Port.Name != "" {
+						// Named port - store port name temporarily as 0
+						// Controller will resolve it by looking up the Service
+						port := int32(0)
+						backendRef.BackendRef.BackendObjectReference.Port = &port
+					}
+
 					backendRefs = append(backendRefs, backendRef)
 				}
 

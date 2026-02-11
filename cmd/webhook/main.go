@@ -64,6 +64,7 @@ func main() {
 	var gatewayAnnotationFilters string
 	var httpRouteAnnotationFilters string
 	var useIngress2Gateway bool
+	var ingressClassFilter string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080",
 		"The address the metric endpoint binds to.")
@@ -100,6 +101,8 @@ func main() {
 		"Provider to use with ingress2gateway (e.g., ingress-nginx, istio, kong)")
 	flag.StringVar(&ingress2GatewayIngressClass, "ingress2gateway-ingress-class", "nginx",
 		"Ingress class name for provider-specific filtering in ingress2gateway")
+	flag.StringVar(&ingressClassFilter, "ingress-class-filter", "*",
+		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). Default '*' processes all classes.")
 
 	opts := zap.Options{
 		Development: true,
@@ -172,8 +175,9 @@ func main() {
 
 	// Register webhook
 	mutator := &webhookhandler.IngressMutator{
-		Client:     mgr.GetClient(),
-		Translator: trans,
+		Client:             mgr.GetClient(),
+		Translator:         trans,
+		IngressClassFilter: ingressClassFilter,
 	}
 
 	mgr.GetWebhookServer().Register("/mutate-v1-ingress",
