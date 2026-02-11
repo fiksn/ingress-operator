@@ -18,6 +18,8 @@ package utils
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,6 +30,7 @@ import (
 const (
 	ManagedByAnnotation = "ingress-operator.fiction.si/managed-by"
 	ManagedByValue      = "ingress-controller"
+	SourceAnnotation    = "ingress-operator.fiction.si/source"
 )
 
 // IsManagedByUs checks if a resource is managed by the ingress operator
@@ -37,6 +40,65 @@ func IsManagedByUs(obj client.Object) bool {
 		return false
 	}
 	return annotations[ManagedByAnnotation] == ManagedByValue
+}
+
+// IsManagedByUsForIngress checks if a resource is managed by the ingress operator
+// AND was created for the specified ingress (exact match for single-source resources)
+func IsManagedByUsForIngress(obj client.Object, ingressNamespace, ingressName string) bool {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		return false
+	}
+
+	// First check if it's managed by us
+	if annotations[ManagedByAnnotation] != ManagedByValue {
+		return false
+	}
+
+	// Then check if the source matches
+	expectedSource := fmt.Sprintf("%s/%s", ingressNamespace, ingressName)
+	return annotations[SourceAnnotation] == expectedSource
+}
+
+// IsManagedByUsWithIngress checks if a resource is managed by the ingress operator
+// AND includes the specified ingress in its source list (for multi-source resources like shared Gateways)
+func IsManagedByUsWithIngress(obj client.Object, ingressNamespace, ingressName string) bool {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		return false
+	}
+
+	// First check if it's managed by us
+	if annotations[ManagedByAnnotation] != ManagedByValue {
+		return false
+	}
+
+	// Check if the ingress is in the comma-separated source list
+	expectedSource := fmt.Sprintf("%s/%s", ingressNamespace, ingressName)
+	sourceAnnotation := annotations[SourceAnnotation]
+	if sourceAnnotation == "" {
+		return false
+	}
+
+	// Check for exact match (single source) or presence in comma-separated list
+	for _, source := range splitSources(sourceAnnotation) {
+		if source == expectedSource {
+			return true
+		}
+	}
+	return false
+}
+
+// splitSources splits a comma-separated source annotation into individual sources
+func splitSources(sources string) []string {
+	var result []string
+	for _, s := range strings.Split(sources, ",") {
+		trimmed := strings.TrimSpace(s)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
 }
 
 // CanUpdateResource checks if we can create or update a resource

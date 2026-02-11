@@ -1,0 +1,37 @@
+Thank you for installing {{ .Chart.Name }}!
+
+Release name: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+The ingress-operator has been deployed successfully.
+
+Configuration:
+- Gateway Namespace: {{ .Values.operator.gatewayNamespace }}
+- Gateway Name: {{ .Values.operator.gatewayName }}
+- Gateway Class: {{ .Values.operator.gatewayClassName }}
+{{- if .Values.operator.watchNamespace }}
+- Watch Namespace: {{ .Values.operator.watchNamespace }}
+{{- else }}
+- Watching: All namespaces
+{{- end }}
+- Ingress Class Filter: {{ .Values.operator.ingressClassFilter }}
+- One Gateway Per Ingress: {{ .Values.operator.oneGatewayPerIngress }}
+- Enable Deletion: {{ .Values.operator.enableDeletion }}
+
+To check the operator status:
+  kubectl -n {{ .Release.Namespace }} get deployment {{ include "ingress-operator.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/name={{ include "ingress-operator.name" . }}
+
+{{- if ne .Values.operator.metricsBindAddress "0" }}
+Metrics are available at:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ingress-operator.fullname" . }}-metrics {{ .Values.service.metricsPort }}
+{{- end }}
+
+Health checks are available at:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ingress-operator.fullname" . }}-health {{ .Values.service.healthPort }}
+
+IMPORTANT: Make sure the Gateway namespace '{{ .Values.operator.gatewayNamespace }}' exists before the operator starts.
+If it doesn't exist, create it with:
+  kubectl create namespace {{ .Values.operator.gatewayNamespace }}
+
+For more information, visit: https://github.com/fiksn/ingress-operator

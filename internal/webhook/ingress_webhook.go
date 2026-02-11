@@ -23,13 +23,10 @@ import (
 	"net/http"
 	"path/filepath"
 
-	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
-	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/fiksn/ingress-operator/internal/metrics"
 	"github.com/fiksn/ingress-operator/internal/translator"
@@ -50,6 +47,7 @@ type IngressMutator struct {
 	decoder            admission.Decoder
 	Translator         *translator.Translator
 	IngressClassFilter string
+	HTTPRouteManager   *utils.HTTPRouteManager
 }
 
 // Handle performs the mutation
@@ -94,10 +92,13 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 	}
 
 	// Resolve any named ports
-	if err := m.resolveNamedPorts(ctx, ingress, httpRoute); err != nil {
+	if err := m.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute); err != nil {
 		logger.Error(err, "failed to resolve named ports")
 		// Continue anyway with fallback ports
 	}
+
+	// Split HTTPRoute if it exceeds the Gateway API limit
+	httpRoutes := m.HTTPRouteManager.SplitHTTPRouteIfNeeded(httpRoute)
 
 	// Create the Gateway resource
 	if err := m.Client.Create(ctx, gateway); err != nil {
@@ -114,19 +115,13 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		metrics.GatewayResourcesTotal.WithLabelValues("create", gateway.Namespace, gateway.Name).Inc()
 	}
 
-	// Create the HTTPRoute resource
-	if err := m.Client.Create(ctx, httpRoute); err != nil {
-		// If already exists, update it
-		if err := m.Client.Update(ctx, httpRoute); err != nil {
-			logger.Error(err, "failed to create/update HTTPRoute")
-			// Don't fail the admission, just log
-		} else {
-			logger.Info("Updated HTTPRoute", "name", httpRoute.Name, "namespace", httpRoute.Namespace)
-			metrics.HTTPRouteResourcesTotal.WithLabelValues("update", httpRoute.Namespace, httpRoute.Name).Inc()
-		}
-	} else {
-		logger.Info("Created HTTPRoute", "name", httpRoute.Name, "namespace", httpRoute.Namespace)
-		metrics.HTTPRouteResourcesTotal.WithLabelValues("create", httpRoute.Namespace, httpRoute.Name).Inc()
+	// Apply all HTTPRoute(s) with proper cleanup of obsolete split routes
+	metricRecorder := func(operation, namespace, name string) {
+		metrics.HTTPRouteResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
+	}
+	if err := m.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, ingress, httpRoutes, metricRecorder); err != nil {
+		logger.Error(err, "failed to apply HTTPRoutes")
+		// Don't fail the admission, just log
 	}
 
 	// Create ReferenceGrant if needed (when Ingress has TLS and Gateway is in different namespace)
@@ -221,86 +216,3 @@ func (m *IngressMutator) matchesIngressClassFilter(ingress *networkingv1.Ingress
 	return matched
 }
 
-// resolveNamedPorts resolves named ports in HTTPRoute by looking up the actual Services
-func (m *IngressMutator) resolveNamedPorts(ctx context.Context, ingress *networkingv1.Ingress, httpRoute *gatewayv1.HTTPRoute) error {
-	logger := log.FromContext(ctx)
-
-	for i := range httpRoute.Spec.Rules {
-		for j := range httpRoute.Spec.Rules[i].BackendRefs {
-			backendRef := &httpRoute.Spec.Rules[i].BackendRefs[j]
-
-			// Check if port is 0 (indicates named port)
-			if backendRef.Port != nil && *backendRef.Port == 0 {
-				serviceName := string(backendRef.Name)
-
-				// Find the named port from the Ingress spec
-				portName := m.findPortNameInIngress(ingress, serviceName)
-				if portName == "" {
-					logger.Info("Could not find port name in Ingress for service, using fallback port 80",
-						"service", serviceName,
-						"namespace", ingress.Namespace)
-					fallbackPort := int32(80)
-					backendRef.Port = &fallbackPort
-					continue
-				}
-
-				// Look up the Service to resolve the named port
-				resolvedPort, err := m.resolveServicePort(ctx, ingress.Namespace, serviceName, portName)
-				if err != nil {
-					logger.Info("Could not resolve named port from Service, using fallback port 80",
-						"service", serviceName,
-						"portName", portName,
-						"namespace", ingress.Namespace,
-						"error", err.Error())
-					fallbackPort := int32(80)
-					backendRef.Port = &fallbackPort
-					continue
-				}
-
-				logger.Info("Resolved named port from Service",
-					"service", serviceName,
-					"portName", portName,
-					"resolvedPort", resolvedPort,
-					"namespace", ingress.Namespace)
-				backendRef.Port = &resolvedPort
-			}
-		}
-	}
-
-	return nil
-}
-
-// findPortNameInIngress finds the port name for a given service in the Ingress spec
-func (m *IngressMutator) findPortNameInIngress(ingress *networkingv1.Ingress, serviceName string) string {
-	for _, rule := range ingress.Spec.Rules {
-		if rule.HTTP != nil {
-			for _, path := range rule.HTTP.Paths {
-				if path.Backend.Service != nil && path.Backend.Service.Name == serviceName {
-					return path.Backend.Service.Port.Name
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// resolveServicePort looks up a Service and resolves a named port to its numeric value
-func (m *IngressMutator) resolveServicePort(ctx context.Context, namespace, serviceName, portName string) (int32, error) {
-	var service corev1.Service
-	err := m.Client.Get(ctx, types.NamespacedName{
-		Namespace: namespace,
-		Name:      serviceName,
-	}, &service)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get Service: %w", err)
-	}
-
-	// Find the port by name
-	for _, port := range service.Spec.Ports {
-		if port.Name == portName {
-			return port.Port, nil
-		}
-	}
-
-	return 0, fmt.Errorf("port %s not found in Service %s", portName, serviceName)
-}

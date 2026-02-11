@@ -19,6 +19,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -54,34 +55,20 @@ func EnsureReferenceGrants(
 	return nil
 }
 
-// CleanupReferenceGrantIfNeeded deletes the ReferenceGrant if no Ingresses with TLS remain in the namespace
+// CleanupReferenceGrantIfNeeded removes the ingress from ReferenceGrant source list
+// and deletes the ReferenceGrant if no sources remain
 func CleanupReferenceGrantIfNeeded(
 	ctx context.Context,
 	c client.Client,
-	namespace string,
+	ingressNamespace string,
+	ingressName string,
 ) error {
 	logger := log.FromContext(ctx)
 
-	// List all Ingresses in this namespace
-	var ingressList networkingv1.IngressList
-	if err := c.List(ctx, &ingressList, client.InNamespace(namespace)); err != nil {
-		return fmt.Errorf("failed to list Ingresses: %w", err)
-	}
-
-	// Check if any Ingress has TLS configuration
-	for _, ingress := range ingressList.Items {
-		if len(ingress.Spec.TLS) > 0 {
-			// Still have Ingresses with TLS, keep the ReferenceGrant
-			logger.V(3).Info("ReferenceGrant still needed", "namespace", namespace,
-				"reason", "Ingress with TLS exists")
-			return nil
-		}
-	}
-
-	// No Ingresses with TLS found, delete the ReferenceGrant if it exists and is managed by us
+	// Get the ReferenceGrant
 	refGrant := &gatewayv1beta1.ReferenceGrant{}
 	err := c.Get(ctx, types.NamespacedName{
-		Namespace: namespace,
+		Namespace: ingressNamespace,
 		Name:      translator.ReferenceGrantName,
 	}, refGrant)
 
@@ -93,16 +80,47 @@ func CleanupReferenceGrantIfNeeded(
 		return err
 	}
 
-	// Delete if managed by us
-	if IsManagedByUs(refGrant) {
-		logger.Info("Deleting ReferenceGrant (no Ingresses with TLS remain)",
-			"namespace", namespace, "name", translator.ReferenceGrantName)
+	// Check if this ReferenceGrant was created for/includes this specific Ingress
+	if !IsManagedByUsWithIngress(refGrant, ingressNamespace, ingressName) {
+		logger.V(3).Info("ReferenceGrant not managed by us for this Ingress, skipping",
+			"namespace", ingressNamespace,
+			"name", translator.ReferenceGrantName,
+			"ingress", ingressName)
+		return nil
+	}
+
+	// Remove this ingress from the source list
+	currentSource := refGrant.Annotations[SourceAnnotation]
+	ingressSource := fmt.Sprintf("%s/%s", ingressNamespace, ingressName)
+
+	sources := splitSources(currentSource)
+	newSources := make([]string, 0, len(sources))
+	for _, source := range sources {
+		if source != ingressSource {
+			newSources = append(newSources, source)
+		}
+	}
+
+	// If no sources remain, delete the ReferenceGrant
+	if len(newSources) == 0 {
+		logger.Info("Deleting ReferenceGrant (no source Ingresses remain)",
+			"namespace", ingressNamespace, "name", translator.ReferenceGrantName)
 		if err := c.Delete(ctx, refGrant); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete ReferenceGrant: %w", err)
 		}
-	} else {
-		logger.Info("ReferenceGrant exists but is not managed by us, skipping deletion",
-			"namespace", namespace, "name", translator.ReferenceGrantName)
+		return nil
+	}
+
+	// Update source annotation with remaining sources
+	newSource := strings.Join(newSources, ",")
+	refGrant.Annotations[SourceAnnotation] = newSource
+	logger.Info("Updating ReferenceGrant source annotation",
+		"namespace", ingressNamespace,
+		"name", translator.ReferenceGrantName,
+		"removedIngress", ingressName,
+		"remainingSources", newSource)
+	if err := c.Update(ctx, refGrant); err != nil {
+		return fmt.Errorf("failed to update ReferenceGrant: %w", err)
 	}
 
 	return nil
@@ -118,8 +136,22 @@ func ApplyReferenceGrant(
 ) error {
 	logger := log.FromContext(ctx)
 
-	// Create ReferenceGrant using translator
-	refGrant := trans.CreateReferenceGrant(ingressNamespace)
+	// Get all Ingresses with TLS in this namespace to track sources
+	var ingressList networkingv1.IngressList
+	if err := c.List(ctx, &ingressList, client.InNamespace(ingressNamespace)); err != nil {
+		return fmt.Errorf("failed to list Ingresses: %w", err)
+	}
+
+	// Filter to only Ingresses with TLS
+	ingressesWithTLS := make([]networkingv1.Ingress, 0)
+	for _, ingress := range ingressList.Items {
+		if len(ingress.Spec.TLS) > 0 {
+			ingressesWithTLS = append(ingressesWithTLS, ingress)
+		}
+	}
+
+	// Create ReferenceGrant using translator with source tracking
+	refGrant := trans.CreateReferenceGrant(ingressNamespace, ingressesWithTLS)
 
 	// Check if ReferenceGrant exists
 	existing := &gatewayv1beta1.ReferenceGrant{}
@@ -144,20 +176,50 @@ func ApplyReferenceGrant(
 		return err
 	}
 
-	// Update existing ReferenceGrant if managed by us
-	if IsManagedByUs(existing) {
-		existing.Spec = refGrant.Spec
-		logger.Info("Updating ReferenceGrant", "namespace", ingressNamespace, "name", translator.ReferenceGrantName)
-		if err := c.Update(ctx, existing); err != nil {
-			return fmt.Errorf("failed to update ReferenceGrant: %w", err)
-		}
-		// Record metric if callback provided
-		if recordMetric != nil {
-			recordMetric("update", ingressNamespace, translator.ReferenceGrantName)
-		}
-	} else {
-		logger.Info("ReferenceGrant exists but is not managed by us, skipping",
+	// Check if we manage this ReferenceGrant by verifying if ANY of the ingresses
+	// we found are in the existing source list
+	if !IsManagedByUs(existing) {
+		logger.Info("ReferenceGrant exists but is not managed by us (no managed-by annotation), skipping",
 			"namespace", ingressNamespace, "name", translator.ReferenceGrantName)
+		return nil
+	}
+
+	// Verify at least one of our ingresses is in the existing source list
+	existingSources := splitSources(existing.Annotations[SourceAnnotation])
+	newSources := splitSources(refGrant.Annotations[SourceAnnotation])
+
+	hasCommonSource := false
+	for _, newSrc := range newSources {
+		for _, existingSrc := range existingSources {
+			if newSrc == existingSrc {
+				hasCommonSource = true
+				break
+			}
+		}
+		if hasCommonSource {
+			break
+		}
+	}
+
+	if !hasCommonSource && len(existingSources) > 0 {
+		logger.Info("ReferenceGrant managed by us but for different ingresses, skipping",
+			"namespace", ingressNamespace,
+			"name", translator.ReferenceGrantName,
+			"existingSources", existing.Annotations[SourceAnnotation],
+			"newSources", refGrant.Annotations[SourceAnnotation])
+		return nil
+	}
+
+	// Update the ReferenceGrant with the complete current list
+	existing.Spec = refGrant.Spec
+	existing.Annotations = refGrant.Annotations // Update annotations including source
+	logger.Info("Updating ReferenceGrant", "namespace", ingressNamespace, "name", translator.ReferenceGrantName)
+	if err := c.Update(ctx, existing); err != nil {
+		return fmt.Errorf("failed to update ReferenceGrant: %w", err)
+	}
+	// Record metric if callback provided
+	if recordMetric != nil {
+		recordMetric("update", ingressNamespace, translator.ReferenceGrantName)
 	}
 
 	return nil

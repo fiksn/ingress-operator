@@ -44,6 +44,7 @@ import (
 
 	"github.com/fiksn/ingress-operator/internal/controller"
 	_ "github.com/fiksn/ingress-operator/internal/metrics" // Import to register metrics
+	"github.com/fiksn/ingress-operator/internal/utils"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -106,7 +107,8 @@ func main() {
 	flag.StringVar(&watchNamespace, "watch-namespace", "",
 		"If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
 	flag.StringVar(&ingressClassFilter, "ingress-class-filter", "*",
-		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). Default '*' processes all classes.")
+		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). "+
+			"Default '*' processes all classes.")
 	flag.BoolVar(&oneGatewayPerIngress, "one-gateway-per-ingress", false,
 		"If true, create a separate Gateway for each Ingress with the same name")
 	flag.BoolVar(&enableDeletion, "enable-deletion", false,
@@ -337,6 +339,9 @@ func main() {
 		UseIngress2Gateway:               useIngress2Gateway,
 		Ingress2GatewayProvider:          ingress2GatewayProvider,
 		Ingress2GatewayIngressClass:      ingress2GatewayIngressClass,
+		HTTPRouteManager: &utils.HTTPRouteManager{
+			Client: mgr.GetClient(),
+		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Ingress")
 		os.Exit(1)

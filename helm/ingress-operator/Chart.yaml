@@ -1,0 +1,13 @@
+apiVersion: v2
+name: ingress-operator
+description: A Kubernetes operator that translates Ingress resources to Gateway API resources
+type: application
+version: 0.0.1
+appVersion: "latest"
+keywords:
+  - ingress
+  - gateway-api
+  - operator
+maintainers:
+  - name: Gregor Pogacnik
+home: https://github.com/fiksn/ingress-operator

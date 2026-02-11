@@ -39,6 +39,7 @@ import (
 const (
 	ManagedByAnnotation      = "ingress-operator.fiction.si/managed-by"
 	ManagedByValue           = "ingress-controller"
+	SourceAnnotation         = "ingress-operator.fiction.si/source"
 	MismatchedCertAnnotation = "ingress-operator.fiction.si/certificate-mismatch"
 	IngressClassAnnotation   = "kubernetes.io/ingress.class"
 	ReferenceGrantName       = "ingress-operator-gateway-secrets"
@@ -193,6 +194,7 @@ func (t *Translator) translateWithIngress2Gateway(
 		gateway.Annotations[k] = v
 	}
 	gateway.Annotations[ManagedByAnnotation] = ManagedByValue
+	gateway.Annotations[SourceAnnotation] = fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
 
 	// Override gateway name/namespace/class to our configured values
 	gateway.Name = t.Config.GatewayName
@@ -237,6 +239,7 @@ func (t *Translator) translateWithIngress2Gateway(
 		httpRoute.Annotations[k] = v
 	}
 	httpRoute.Annotations[ManagedByAnnotation] = ManagedByValue
+	httpRoute.Annotations[SourceAnnotation] = fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
 
 	// Update parent refs to point to our configured gateway
 	for i := range httpRoute.Spec.ParentRefs {
@@ -321,6 +324,13 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 	}
 
 	gateway.Annotations[ManagedByAnnotation] = ManagedByValue
+
+	// Track source ingresses
+	sourceNames := make([]string, 0, len(ingresses))
+	for _, ingress := range ingresses {
+		sourceNames = append(sourceNames, fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name))
+	}
+	gateway.Annotations[SourceAnnotation] = strings.Join(sourceNames, ",")
 
 	// Check if any ingress in this group should have private annotations
 	applyPrivateAnnotations := false
@@ -501,6 +511,7 @@ func (t *Translator) TranslateToGateway(ingress *networkingv1.Ingress) *gatewayv
 	}
 
 	gateway.Annotations[ManagedByAnnotation] = ManagedByValue
+	gateway.Annotations[SourceAnnotation] = fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
 
 	// Determine if private annotations should be applied
 	ingressClass := t.GetIngressClass(ingress)
@@ -635,6 +646,7 @@ func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewa
 		httpRoute.Annotations = make(map[string]string)
 	}
 	httpRoute.Annotations[ManagedByAnnotation] = ManagedByValue
+	httpRoute.Annotations[SourceAnnotation] = fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
 
 	// Collect hostnames from ingress and apply transformation
 	hostnames := make([]gatewayv1.Hostname, 0)
@@ -679,12 +691,12 @@ func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewa
 					if path.Backend.Service.Port.Number > 0 {
 						// Use numeric port
 						port := path.Backend.Service.Port.Number
-						backendRef.BackendRef.BackendObjectReference.Port = &port
+						backendRef.BackendObjectReference.Port = &port
 					} else if path.Backend.Service.Port.Name != "" {
 						// Named port - store port name temporarily as 0
 						// Controller will resolve it by looking up the Service
 						port := int32(0)
-						backendRef.BackendRef.BackendObjectReference.Port = &port
+						backendRef.BackendObjectReference.Port = &port
 					}
 
 					backendRefs = append(backendRefs, backendRef)
@@ -898,13 +910,21 @@ func (t *Translator) GetNamespacesWithTLS(ingresses []networkingv1.Ingress) []st
 
 // CreateReferenceGrant creates a ReferenceGrant resource for the given namespace
 // This allows a Gateway in the Gateway namespace to access Secrets in the Ingress namespace
-func (t *Translator) CreateReferenceGrant(ingressNamespace string) *gatewayv1beta1.ReferenceGrant {
+// ingresses parameter is the list of Ingresses with TLS in this namespace (for source tracking)
+func (t *Translator) CreateReferenceGrant(ingressNamespace string, ingresses []networkingv1.Ingress) *gatewayv1beta1.ReferenceGrant {
+	// Track source ingresses
+	sourceNames := make([]string, 0, len(ingresses))
+	for _, ingress := range ingresses {
+		sourceNames = append(sourceNames, fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name))
+	}
+
 	return &gatewayv1beta1.ReferenceGrant{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ReferenceGrantName,
 			Namespace: ingressNamespace,
 			Annotations: map[string]string{
 				ManagedByAnnotation: ManagedByValue,
+				SourceAnnotation:    strings.Join(sourceNames, ","),
 			},
 		},
 		Spec: gatewayv1beta1.ReferenceGrantSpec{

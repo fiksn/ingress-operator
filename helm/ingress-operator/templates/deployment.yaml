@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ingress-operator.fullname" . }}
+  labels:
+    {{- include "ingress-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ingress-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "ingress-operator.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ingress-operator.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: operator
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --gateway-namespace={{ .Values.operator.gatewayNamespace }}
+            - --gateway-name={{ .Values.operator.gatewayName }}
+            - --gateway-class-name={{ .Values.operator.gatewayClassName }}
+            {{- if .Values.operator.watchNamespace }}
+            - --watch-namespace={{ .Values.operator.watchNamespace }}
+            {{- end }}
+            - --ingress-class-filter={{ .Values.operator.ingressClassFilter }}
+            {{- if .Values.operator.oneGatewayPerIngress }}
+            - --one-gateway-per-ingress=true
+            {{- end }}
+            {{- if .Values.operator.enableDeletion }}
+            - --enable-deletion=true
+            {{- end }}
+            {{- if .Values.operator.hostnameRewriteFrom }}
+            - --hostname-rewrite-from={{ .Values.operator.hostnameRewriteFrom }}
+            {{- end }}
+            {{- if .Values.operator.hostnameRewriteTo }}
+            - --hostname-rewrite-to={{ .Values.operator.hostnameRewriteTo }}
+            {{- end }}
+            {{- if .Values.operator.disableSourceIngress }}
+            - --disable-source-ingress=true
+            {{- end }}
+            {{- if .Values.operator.gatewayAnnotations }}
+            - --gateway-annotations={{ .Values.operator.gatewayAnnotations }}
+            {{- end }}
+            {{- if .Values.operator.gatewayInfraAnnotations }}
+            - --gateway-infrastructure-annotations={{ .Values.operator.gatewayInfraAnnotations }}
+            {{- end }}
+            {{- if .Values.operator.privateAnnotations }}
+            - --private-annotations={{ .Values.operator.privateAnnotations }}
+            {{- end }}
+            {{- if .Values.operator.private }}
+            - --private=true
+            {{- end }}
+            - --private-ingress-class-pattern={{ .Values.operator.privateIngressClassPattern }}
+            - --gateway-annotation-filters={{ .Values.operator.gatewayAnnotationFilters }}
+            - --httproute-annotation-filters={{ .Values.operator.httpRouteAnnotationFilters }}
+            {{- if .Values.operator.useIngress2Gateway }}
+            - --use-ingress2gateway=true
+            - --ingress2gateway-provider={{ .Values.operator.ingress2GatewayProvider }}
+            - --ingress2gateway-ingress-class={{ .Values.operator.ingress2GatewayIngressClass }}
+            {{- end }}
+            {{- if .Values.operator.leaderElect }}
+            - --leader-elect=true
+            {{- end }}
+            - --metrics-bind-address={{ .Values.operator.metricsBindAddress }}
+            - --health-probe-bind-address={{ .Values.operator.healthProbeBindAddress }}
+            {{- if .Values.operator.metricsSecure }}
+            - --metrics-secure=true
+            {{- else }}
+            - --metrics-secure=false
+            {{- end }}
+            {{- if .Values.operator.enableHTTP2 }}
+            - --enable-http2=true
+            {{- end }}
+            {{- if .Values.certificates.metrics.path }}
+            - --metrics-cert-path={{ .Values.certificates.metrics.path }}
+            - --metrics-cert-name={{ .Values.certificates.metrics.certName }}
+            - --metrics-cert-key={{ .Values.certificates.metrics.keyName }}
+            {{- end }}
+            {{- if .Values.certificates.webhook.path }}
+            - --webhook-cert-path={{ .Values.certificates.webhook.path }}
+            - --webhook-cert-name={{ .Values.certificates.webhook.certName }}
+            - --webhook-cert-key={{ .Values.certificates.webhook.keyName }}
+            {{- end }}
+          ports:
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+            {{- if ne .Values.operator.metricsBindAddress "0" }}
+            - name: metrics
+              containerPort: {{ .Values.operator.metricsSecure | ternary 8443 8080 }}
+              protocol: TCP
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

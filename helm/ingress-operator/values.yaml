@@ -1,0 +1,129 @@
+# Default values for ingress-operator
+
+replicaCount: 1
+
+image:
+  repository: fiksn/ingress-operator
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Operator configuration
+operator:
+  # Gateway configuration
+  gatewayNamespace: nginx-fabric
+  gatewayName: ingress-gateway
+  gatewayClassName: nginx
+
+  # Namespace to watch (empty means all namespaces)
+  watchNamespace: ""
+
+  # Ingress class filter (glob pattern, default "*" processes all)
+  ingressClassFilter: "*"
+
+  # If true, create a separate Gateway for each Ingress
+  oneGatewayPerIngress: false
+
+  # If true, delete HTTPRoute and Gateway when Ingress is deleted
+  enableDeletion: false
+
+  # Hostname rewriting (comma-separated, must have same number of items)
+  hostnameRewriteFrom: ""
+  hostnameRewriteTo: ""
+
+  # If true, disable source Ingress by removing its ingressClassName
+  disableSourceIngress: false
+
+  # Gateway annotations (comma-separated key=value pairs)
+  gatewayAnnotations: "cert-manager.io/acme-challenge-type=dns01,cert-manager.io/acme-dns01-provider=default,cert-manager.io/cluster-issuer=letsencrypt-cert-manager"
+
+  # Gateway infrastructure annotations (comma-separated key=value pairs)
+  gatewayInfraAnnotations: ""
+
+  # Private annotations (comma-separated key=value pairs)
+  privateAnnotations: "service.beta.kubernetes.io/aws-load-balancer-internal=true,service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip,service.beta.kubernetes.io/aws-load-balancer-type=nlb"
+
+  # If true, apply private annotations to all Gateways
+  private: false
+
+  # Glob pattern for ingress classes that should get private annotations
+  privateIngressClassPattern: "*private*"
+
+  # Annotation filters (comma-separated prefixes to exclude)
+  gatewayAnnotationFilters: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io,ingress-operator.fiction.si"
+  httpRouteAnnotationFilters: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io,ingress-operator.fiction.si"
+
+  # ingress2gateway configuration
+  useIngress2Gateway: false
+  ingress2GatewayProvider: "ingress-nginx"
+  ingress2GatewayIngressClass: "nginx"
+
+  # Leader election
+  leaderElect: false
+
+  # Metrics configuration
+  metricsBindAddress: "0"  # Use "0" to disable, ":8443" for HTTPS, ":8080" for HTTP
+  metricsSecure: true
+
+  # Health probe configuration
+  healthProbeBindAddress: ":8081"
+
+  # HTTP/2 configuration
+  enableHTTP2: false
+
+# Service configuration for metrics and health probes
+service:
+  type: ClusterIP
+  metricsPort: 8443
+  healthPort: 8081
+
+# Optional certificate paths for metrics (leave empty for auto-generated)
+certificates:
+  metrics:
+    path: ""
+    certName: "tls.crt"
+    keyName: "tls.key"
+  webhook:
+    path: ""
+    certName: "tls.crt"
+    keyName: "tls.key"
