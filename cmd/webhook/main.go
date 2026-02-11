@@ -78,9 +78,9 @@ func main() {
 	flag.StringVar(&gatewayClassName, "gateway-class-name", "nginx",
 		"The GatewayClass to use for created Gateway resources")
 	flag.StringVar(&hostnameRewriteFrom, "hostname-rewrite-from", "",
-		"Domain suffix to match for rewriting")
+		"Comma-separated list of domain suffixes to match for rewriting")
 	flag.StringVar(&hostnameRewriteTo, "hostname-rewrite-to", "",
-		"Replacement domain suffix")
+		"Comma-separated list of replacement domain suffixes (must match count of --hostname-rewrite-from)")
 	flag.StringVar(&gatewayAnnotations, "gateway-annotations", "",
 		"Comma-separated key=value pairs for Gateway metadata annotations")
 	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",

@@ -1,6 +1,6 @@
 # ingress-operator
 Ingress operator is a way to transition from [ingress-nginx](https://github.com/kubernetes/ingress-nginx) to [nginx-gateway-fabric](https://github.com/nginx/nginx-gateway-fabric)
-and get started with the [Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/).
+and get started with the [Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/)
 
 It can transparently create `Gateway` and `Httproute` resources from `Ingress` (and possibly even delete the `Ingress` altogether afterwards).
 
@@ -13,7 +13,7 @@ will not get security updates after March 2026 !!!
 Unfortunately that is not always the case and an `Ingress` might be provisioned without your control. Ingress-operator includes the mentioned tool as a library
 so you can benefit from all translation quirks implemented there.
 
-However the tool is primarily meant for `ingress-nginx` audience and comes with a few opinionated but sane defaults.
+However this tool is primarily meant for `ingress-nginx` audience and comes with a few opinionated but sane defaults.
 
 For instance operator enables a "shared mode" (unless you start it with `--one-gateway-per-ingress`) which means you do not need a new `Gateway` for each `Ingress` but
 can aggregate multiple vhosts in one thereby save cluster resources. This way you just get one (or if you change `nginxproxies` crd also more)
@@ -728,7 +728,7 @@ More information can be found via the [Kubebuilder Documentation](https://book.k
 
 ## License
 
-Copyright 2026.
+Copyright Gregor Pogacnik 2026.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

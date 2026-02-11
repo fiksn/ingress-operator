@@ -19,12 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/fiksn/ingress-operator/internal/translator"
 )
@@ -233,8 +232,9 @@ func (r *IngressReconciler) reconcileSharedGateways(
 	for ingressClass, classIngresses := range ingressesByClass {
 		gatewayName := r.getGatewayNameForClass(ingressClass)
 
-		// Create a merged Gateway from all ingresses in this class
-		gateway := r.synthesizeSharedGateway(classIngresses, gatewayName)
+		// Create a merged Gateway from all ingresses in this class using translator
+		trans := r.getTranslator()
+		gateway := trans.TranslateMultipleToSharedGateway(classIngresses, gatewayName)
 
 		// Check if we can manage the Gateway resource
 		gatewayNN := types.NamespacedName{
@@ -255,13 +255,22 @@ func (r *IngressReconciler) reconcileSharedGateways(
 				continue
 			}
 			logger.Info("Gateway applied successfully", "namespace", gateway.Namespace, "name", gateway.Name)
+
+			// Create ReferenceGrants for cross-namespace secret access
+			// Only needed when Gateway is in different namespace than Ingress secrets
+			// Skip in ingress2gateway mode as it handles this itself
+			if !r.UseIngress2Gateway {
+				if err := r.ensureReferenceGrants(ctx, classIngresses); err != nil {
+					logger.Error(err, "failed to ensure ReferenceGrants")
+					// Don't fail the reconciliation, just log the error
+				}
+			}
 		} else {
 			logger.Info("Skipping Gateway synthesis - resource exists and is not managed by us",
 				"namespace", gatewayNN.Namespace, "name", gatewayNN.Name)
 		}
 
 		// Create HTTPRoutes using translator for each Ingress in this class
-		trans := r.getTranslator()
 		for _, ingress := range classIngresses {
 			// Override gateway name for this class
 			transConfig := trans.Config
@@ -321,8 +330,9 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 		return ctrl.Result{}, err
 	}
 
-	// Delete Gateway (only in one-gateway-per-ingress mode)
+	// Handle Gateway cleanup
 	if r.OneGatewayPerIngress {
+		// In one-gateway-per-ingress mode, delete the entire Gateway
 		gatewayName := ingress.Name
 		gateway := &gatewayv1.Gateway{}
 		err := r.Get(ctx, types.NamespacedName{
@@ -346,8 +356,54 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 			logger.Error(err, "error checking Gateway")
 			return ctrl.Result{}, err
 		}
+	} else {
+		// In shared gateway mode, remove listeners associated with this Ingress
+		trans := r.getTranslator()
+		ingressClass := trans.GetIngressClass(ingress)
+		gatewayName := r.getGatewayNameForClass(ingressClass)
+
+		gateway := &gatewayv1.Gateway{}
+		err := r.Get(ctx, types.NamespacedName{
+			Namespace: r.GatewayNamespace,
+			Name:      gatewayName,
+		}, gateway)
+
+		if err == nil && r.isManagedByUs(gateway) {
+			// Remove listeners for hostnames from this Ingress
+			r.removeIngressListeners(gateway, ingress)
+
+			if len(gateway.Spec.Listeners) == 0 {
+				// No more listeners, delete the Gateway
+				logger.Info("Deleting Gateway with no remaining listeners",
+					"namespace", gateway.Namespace, "name", gateway.Name)
+				if err := r.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
+					logger.Error(err, "failed to delete Gateway")
+					return ctrl.Result{}, err
+				}
+			} else {
+				// Update Gateway with remaining listeners
+				logger.Info("Removing listeners from shared Gateway",
+					"namespace", gateway.Namespace, "name", gateway.Name,
+					"remainingListeners", len(gateway.Spec.Listeners))
+				if err := r.Update(ctx, gateway); err != nil {
+					logger.Error(err, "failed to update Gateway")
+					return ctrl.Result{}, err
+				}
+			}
+		} else if err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "error checking Gateway")
+			return ctrl.Result{}, err
+		}
+
+		// Check if ReferenceGrant should be cleaned up
+		// Only if this Ingress had TLS and Gateway is in different namespace
+		if !r.UseIngress2Gateway && len(ingress.Spec.TLS) > 0 && ingress.Namespace != r.GatewayNamespace {
+			if err := r.cleanupReferenceGrantIfNeeded(ctx, ingress.Namespace); err != nil {
+				logger.Error(err, "failed to cleanup ReferenceGrant", "namespace", ingress.Namespace)
+				// Don't fail the reconciliation, just log the error
+			}
+		}
 	}
-	// Note: In shared gateway mode, we don't delete the Gateway as other Ingresses may be using it
 
 	// Remove finalizer
 	if containsString(ingress.Finalizers, FinalizerName) {
@@ -438,95 +494,11 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 	return nil
 }
 
-// Helper methods for synthesizeSharedGateway
-func (r *IngressReconciler) getIngressClass(ingress *networkingv1.Ingress) string {
-	if ingress.Spec.IngressClassName != nil && *ingress.Spec.IngressClassName != "" {
-		return *ingress.Spec.IngressClassName
-	}
-	if ingress.Annotations != nil {
-		if class, ok := ingress.Annotations[IngressClassAnnotation]; ok && class != "" {
-			return class
-		}
-	}
-	return "default"
-}
-
-func (r *IngressReconciler) shouldApplyPrivateAnnotations(ingressClass string) bool {
-	if r.ApplyPrivateToAll {
-		return true
-	}
-	if r.PrivateIngressClassPattern == "" {
-		return false
-	}
-	matched, err := filepath.Match(r.PrivateIngressClassPattern, ingressClass)
-	if err != nil {
-		log.Log.WithName("shouldApplyPrivateAnnotations").Error(
-			err, "Invalid pattern", "pattern", r.PrivateIngressClassPattern)
-		return false
-	}
-	return matched
-}
-
-func (r *IngressReconciler) transformHostname(hostname string) string {
-	if r.HostnameRewriteFrom == "" || r.HostnameRewriteTo == "" {
-		return hostname
-	}
-	if strings.HasSuffix(hostname, r.HostnameRewriteFrom) {
-		prefix := strings.TrimSuffix(hostname, r.HostnameRewriteFrom)
-		prefix = strings.TrimSuffix(prefix, ".")
-		if prefix != "" {
-			return prefix + "." + r.HostnameRewriteTo
-		}
-		return r.HostnameRewriteTo
-	}
-	return hostname
-}
-
-func (r *IngressReconciler) checkCertificateMatch(originalHostname, transformedHostname string,
-	tlsHosts []string) bool {
-
-	if originalHostname == transformedHostname {
-		return true
-	}
-	for _, host := range tlsHosts {
-		if host == transformedHostname {
-			return true
-		}
-		if strings.HasPrefix(host, "*.") {
-			wildcard := host[2:]
-			if strings.HasSuffix(transformedHostname, wildcard) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (r *IngressReconciler) filterAnnotations(annotations map[string]string,
-	filters []string) map[string]string {
-	if annotations == nil {
-		return nil
-	}
-	filtered := make(map[string]string)
-	for key, value := range annotations {
-		shouldInclude := true
-		for _, filter := range filters {
-			if strings.HasPrefix(key, filter) {
-				shouldInclude = false
-				break
-			}
-		}
-		if shouldInclude {
-			filtered[key] = value
-		}
-	}
-	return filtered
-}
-
 func (r *IngressReconciler) groupIngressesByClass(ingresses []networkingv1.Ingress) map[string][]networkingv1.Ingress {
+	trans := r.getTranslator()
 	result := make(map[string][]networkingv1.Ingress)
 	for _, ingress := range ingresses {
-		class := r.getIngressClass(&ingress)
+		class := trans.GetIngressClass(&ingress)
 		result[class] = append(result[class], ingress)
 	}
 	return result
@@ -570,175 +542,6 @@ func (r *IngressReconciler) applyHTTPRouteIfManaged(ctx context.Context, httpRou
 
 // synthesizeSharedGateway creates a single Gateway by merging listeners from multiple ingresses
 // This is used in shared gateway mode where multiple ingresses share one gateway
-func (r *IngressReconciler) synthesizeSharedGateway(ingresses []networkingv1.Ingress,
-	gatewayName string) *gatewayv1.Gateway {
-	gateway := &gatewayv1.Gateway{}
-	gateway.Name = gatewayName
-	gateway.Namespace = r.GatewayNamespace
-	gateway.Spec.GatewayClassName = "nginx"
-
-	// Merge annotations from all ingresses (with filtering)
-	gateway.Annotations = make(map[string]string)
-	for _, ingress := range ingresses {
-		filtered := r.filterAnnotations(ingress.Annotations, r.GatewayAnnotationFilters)
-		for k, v := range filtered {
-			gateway.Annotations[k] = v
-		}
-	}
-
-	// Apply default gateway annotations
-	for key, value := range r.DefaultGatewayAnnotations {
-		gateway.Annotations[key] = value
-	}
-
-	gateway.Annotations[ManagedByAnnotation] = ManagedByValue
-
-	// Check if any ingress in this group should have private annotations
-	applyPrivateAnnotations := false
-	for _, ingress := range ingresses {
-		ingressClass := r.getIngressClass(&ingress)
-		if r.shouldApplyPrivateAnnotations(ingressClass) {
-			applyPrivateAnnotations = true
-			break
-		}
-	}
-
-	// Add infrastructure annotations if any are configured
-	if len(r.GatewayInfrastructureAnnotations) > 0 ||
-		(applyPrivateAnnotations && len(r.PrivateInfrastructureAnnotations) > 0) {
-		gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
-			Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
-		}
-
-		// Apply base infrastructure annotations (applied to all)
-		for key, value := range r.GatewayInfrastructureAnnotations {
-			gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
-		}
-
-		// Apply private annotations if any ingress matches conditions
-		if applyPrivateAnnotations {
-			for key, value := range r.PrivateInfrastructureAnnotations {
-				gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
-			}
-		}
-	}
-
-	// Collect unique hostnames with their TLS configurations, namespace, and unique namespaces
-	type hostnameInfo struct {
-		tlsConfig *networkingv1.IngressTLS
-		namespace string
-	}
-	hostnameMap := make(map[string]hostnameInfo)
-	namespacesSet := make(map[string]bool)
-
-	for _, ingress := range ingresses {
-		namespacesSet[ingress.Namespace] = true
-		for _, rule := range ingress.Spec.Rules {
-			if rule.Host != "" {
-				// Find TLS config for this host
-				var tlsConfig *networkingv1.IngressTLS
-				for _, tls := range ingress.Spec.TLS {
-					for _, host := range tls.Hosts {
-						if host == rule.Host {
-							tlsConfig = &tls
-							break
-						}
-					}
-					if tlsConfig != nil {
-						break
-					}
-				}
-				hostnameMap[rule.Host] = hostnameInfo{
-					tlsConfig: tlsConfig,
-					namespace: ingress.Namespace,
-				}
-			}
-		}
-	}
-
-	// Convert namespaces set to slice for label selector
-	namespacesList := make([]string, 0, len(namespacesSet))
-	for ns := range namespacesSet {
-		namespacesList = append(namespacesList, ns)
-	}
-
-	// Create listeners for each unique hostname
-	listeners := make([]gatewayv1.Listener, 0, len(hostnameMap))
-	certMismatches := make([]string, 0)
-	logger := log.Log.WithName("synthesizeGateway")
-
-	for hostname, info := range hostnameMap {
-		// Apply hostname transformation for Gateway listener if configured
-		transformedHostname := r.transformHostname(hostname)
-
-		listener := gatewayv1.Listener{
-			Name:     gatewayv1.SectionName(transformedHostname), // Use transformed hostname as section name
-			Hostname: (*gatewayv1.Hostname)(&transformedHostname),
-			Port:     gatewayv1.PortNumber(443),
-			Protocol: gatewayv1.HTTPSProtocolType,
-			AllowedRoutes: &gatewayv1.AllowedRoutes{
-				Namespaces: &gatewayv1.RouteNamespaces{
-					From: func() *gatewayv1.FromNamespaces {
-						from := gatewayv1.NamespacesFromSelector
-						return &from
-					}(),
-					Selector: &metav1.LabelSelector{
-						MatchExpressions: []metav1.LabelSelectorRequirement{
-							{
-								Key:      "kubernetes.io/metadata.name",
-								Operator: metav1.LabelSelectorOpIn,
-								Values:   namespacesList,
-							},
-						},
-					},
-				},
-			},
-		}
-
-		if info.tlsConfig != nil && info.tlsConfig.SecretName != "" {
-			secretName := info.tlsConfig.SecretName
-
-			// Check if hostname was transformed and certificate doesn't match
-			if hostname != transformedHostname && !r.checkCertificateMatch(hostname, transformedHostname, info.tlsConfig.Hosts) {
-				// Generate new secret name for transformed hostname
-				// Replace dots with dashes and append -tls suffix
-				newSecretName := strings.ReplaceAll(transformedHostname, ".", "-") + "-tls"
-				logger.Info("Certificate doesn't match transformed hostname, using new secret name",
-					"original", hostname,
-					"transformed", transformedHostname,
-					"originalSecret", info.tlsConfig.SecretName,
-					"newSecret", newSecretName,
-					"certHosts", info.tlsConfig.Hosts)
-				certMismatches = append(certMismatches,
-					fmt.Sprintf("%s->%s: %s->%s", hostname, transformedHostname,
-						info.tlsConfig.SecretName, newSecretName))
-				secretName = newSecretName
-			}
-
-			mode := gatewayv1.TLSModeTerminate
-			listener.TLS = &gatewayv1.ListenerTLSConfig{
-				Mode: &mode,
-				CertificateRefs: []gatewayv1.SecretObjectReference{
-					{
-						Name:      gatewayv1.ObjectName(secretName),
-						Namespace: (*gatewayv1.Namespace)(&info.namespace),
-					},
-				},
-			}
-		}
-
-		listeners = append(listeners, listener)
-	}
-
-	// Add info annotation if there are certificate changes
-	if len(certMismatches) > 0 {
-		gateway.Annotations[MismatchedCertAnnotation] = strings.Join(certMismatches, "; ")
-	}
-
-	gateway.Spec.Listeners = listeners
-	return gateway
-}
-
 func (r *IngressReconciler) isManagedByUs(obj client.Object) bool {
 	annotations := obj.GetAnnotations()
 	if annotations == nil {
@@ -799,15 +602,191 @@ func (r *IngressReconciler) applyGateway(
 		return err
 	}
 
-	// Update existing Gateway
-	existing.Annotations = desired.Annotations
-	existing.Spec = desired.Spec
+	// Merge with existing Gateway instead of replacing
+	// This allows multiple operator instances watching different namespaces to share the same Gateway
+	r.mergeGatewaySpec(existing, desired)
+
 	logger.Info("Updating Gateway", "namespace", existing.Namespace, "name", existing.Name)
 	if err := r.Update(ctx, existing); err != nil {
 		return fmt.Errorf("failed to update Gateway: %w", err)
 	}
 
 	return nil
+}
+
+// removeIngressListeners removes listeners from the Gateway that correspond to hostnames in the Ingress
+// Also cleans up certificate-mismatch annotation entries for removed hostnames
+func (r *IngressReconciler) removeIngressListeners(gateway *gatewayv1.Gateway, ingress *networkingv1.Ingress) {
+	trans := r.getTranslator()
+
+	// Build set of hostnames from this Ingress (with transformation applied)
+	hostnamesToRemove := make(map[string]bool)
+	originalToTransformed := make(map[string]string)
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host != "" {
+			transformedHostname := trans.TransformHostname(rule.Host)
+			hostnamesToRemove[transformedHostname] = true
+			originalToTransformed[rule.Host] = transformedHostname
+		}
+	}
+
+	// Filter out listeners matching these hostnames
+	remainingListeners := make([]gatewayv1.Listener, 0)
+	for _, listener := range gateway.Spec.Listeners {
+		// Listener name is the hostname (as per synthesizeSharedGateway)
+		listenerHostname := string(listener.Name)
+		if !hostnamesToRemove[listenerHostname] {
+			remainingListeners = append(remainingListeners, listener)
+		}
+	}
+
+	gateway.Spec.Listeners = remainingListeners
+
+	// Clean up certificate-mismatch annotation entries for removed hostnames
+	if gateway.Annotations != nil {
+		if certMismatch, exists := gateway.Annotations[MismatchedCertAnnotation]; exists {
+			gateway.Annotations[MismatchedCertAnnotation] =
+				r.removeCertMismatchEntries(certMismatch, originalToTransformed)
+		}
+	}
+}
+
+// mergeGatewaySpec merges the desired Gateway spec into the existing Gateway
+// Listeners are merged by hostname (unique by listener name)
+// Annotations are merged (desired overwrites existing on conflict, except for special cases)
+func (r *IngressReconciler) mergeGatewaySpec(existing, desired *gatewayv1.Gateway) {
+	// Merge annotations - desired annotations overwrite existing ones
+	if existing.Annotations == nil {
+		existing.Annotations = make(map[string]string)
+	}
+	for k, v := range desired.Annotations {
+		// Special handling for certificate-mismatch annotation - merge instead of overwrite
+		if k == MismatchedCertAnnotation {
+			existing.Annotations[k] = r.mergeCertificateMismatchAnnotation(
+				existing.Annotations[k], v)
+		} else {
+			existing.Annotations[k] = v
+		}
+	}
+
+	// Update GatewayClassName
+	existing.Spec.GatewayClassName = desired.Spec.GatewayClassName
+
+	// Merge Infrastructure annotations
+	if desired.Spec.Infrastructure != nil {
+		if existing.Spec.Infrastructure == nil {
+			existing.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
+				Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
+			}
+		}
+		if existing.Spec.Infrastructure.Annotations == nil {
+			existing.Spec.Infrastructure.Annotations = make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue)
+		}
+		for k, v := range desired.Spec.Infrastructure.Annotations {
+			existing.Spec.Infrastructure.Annotations[k] = v
+		}
+	}
+
+	// Merge listeners - use listener name as unique key
+	// Build map of existing listeners by name
+	existingListeners := make(map[gatewayv1.SectionName]gatewayv1.Listener)
+	for _, listener := range existing.Spec.Listeners {
+		existingListeners[listener.Name] = listener
+	}
+
+	// Add or update listeners from desired
+	for _, desiredListener := range desired.Spec.Listeners {
+		existingListeners[desiredListener.Name] = desiredListener
+	}
+
+	// Convert map back to slice
+	mergedListeners := make([]gatewayv1.Listener, 0, len(existingListeners))
+	for _, listener := range existingListeners {
+		mergedListeners = append(mergedListeners, listener)
+	}
+
+	existing.Spec.Listeners = mergedListeners
+}
+
+// mergeCertificateMismatchAnnotation merges certificate mismatch values from multiple reconciliations
+// Values are semicolon-separated, and we deduplicate them
+func (r *IngressReconciler) mergeCertificateMismatchAnnotation(existing, desired string) string {
+	if existing == "" {
+		return desired
+	}
+	if desired == "" {
+		return existing
+	}
+
+	// Split both by semicolon and collect unique values
+	valuesMap := make(map[string]bool)
+
+	// Add existing values
+	for _, val := range strings.Split(existing, ";") {
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			valuesMap[trimmed] = true
+		}
+	}
+
+	// Add desired values
+	for _, val := range strings.Split(desired, ";") {
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			valuesMap[trimmed] = true
+		}
+	}
+
+	// Convert back to slice and sort for consistent ordering
+	values := make([]string, 0, len(valuesMap))
+	for val := range valuesMap {
+		values = append(values, val)
+	}
+
+	// Join with semicolon-space separator
+	return strings.Join(values, "; ")
+}
+
+// removeCertMismatchEntries removes certificate mismatch entries that match the given hostname mappings
+// Format: "original->transformed: namespace/secret->namespace/newsecret"
+func (r *IngressReconciler) removeCertMismatchEntries(
+	certMismatch string, hostnameMappings map[string]string,
+) string {
+	if certMismatch == "" {
+		return ""
+	}
+
+	// Split by semicolon
+	entries := strings.Split(certMismatch, ";")
+	remainingEntries := make([]string, 0, len(entries))
+
+	for _, entry := range entries {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
+			continue
+		}
+
+		// Check if this entry matches any hostname mapping to remove
+		// Format: "original->transformed: ..."
+		shouldKeep := true
+		for original, transformed := range hostnameMappings {
+			prefix := original + "->" + transformed + ":"
+			if strings.HasPrefix(trimmed, prefix) {
+				shouldKeep = false
+				break
+			}
+		}
+
+		if shouldKeep {
+			remainingEntries = append(remainingEntries, trimmed)
+		}
+	}
+
+	if len(remainingEntries) == 0 {
+		return ""
+	}
+
+	return strings.Join(remainingEntries, "; ")
 }
 
 func (r *IngressReconciler) applyHTTPRoute(
@@ -839,6 +818,117 @@ func (r *IngressReconciler) applyHTTPRoute(
 	logger.Info("Updating HTTPRoute", "namespace", existing.Namespace, "name", existing.Name)
 	if err := r.Update(ctx, existing); err != nil {
 		return fmt.Errorf("failed to update HTTPRoute: %w", err)
+	}
+
+	return nil
+}
+
+// ensureReferenceGrants creates ReferenceGrant resources to allow Gateway to access Secrets in Ingress namespaces
+func (r *IngressReconciler) ensureReferenceGrants(ctx context.Context, ingresses []networkingv1.Ingress) error {
+	logger := log.FromContext(ctx)
+	trans := r.getTranslator()
+
+	// Get namespaces that need ReferenceGrants using translator
+	namespacesWithTLS := trans.GetNamespacesWithTLS(ingresses)
+
+	// Create ReferenceGrant in each namespace
+	for _, namespace := range namespacesWithTLS {
+		if err := r.applyReferenceGrant(ctx, namespace); err != nil {
+			logger.Error(err, "failed to apply ReferenceGrant", "namespace", namespace)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// cleanupReferenceGrantIfNeeded deletes the ReferenceGrant if no Ingresses with TLS remain in the namespace
+func (r *IngressReconciler) cleanupReferenceGrantIfNeeded(ctx context.Context, namespace string) error {
+	logger := log.FromContext(ctx)
+
+	// List all Ingresses in this namespace
+	var ingressList networkingv1.IngressList
+	if err := r.List(ctx, &ingressList, client.InNamespace(namespace)); err != nil {
+		return fmt.Errorf("failed to list Ingresses: %w", err)
+	}
+
+	// Check if any Ingress has TLS configuration
+	for _, ingress := range ingressList.Items {
+		if len(ingress.Spec.TLS) > 0 {
+			// Still have Ingresses with TLS, keep the ReferenceGrant
+			logger.V(3).Info("ReferenceGrant still needed", "namespace", namespace,
+				"reason", "Ingress with TLS exists")
+			return nil
+		}
+	}
+
+	// No Ingresses with TLS found, delete the ReferenceGrant if it exists and is managed by us
+	refGrant := &gatewayv1beta1.ReferenceGrant{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: namespace,
+		Name:      translator.ReferenceGrantName,
+	}, refGrant)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Already deleted, nothing to do
+			return nil
+		}
+		return err
+	}
+
+	// Delete if managed by us
+	if r.isManagedByUs(refGrant) {
+		logger.Info("Deleting ReferenceGrant (no Ingresses with TLS remain)",
+			"namespace", namespace, "name", translator.ReferenceGrantName)
+		if err := r.Delete(ctx, refGrant); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete ReferenceGrant: %w", err)
+		}
+	} else {
+		logger.Info("ReferenceGrant exists but is not managed by us, skipping deletion",
+			"namespace", namespace, "name", translator.ReferenceGrantName)
+	}
+
+	return nil
+}
+
+// applyReferenceGrant creates or updates a ReferenceGrant in the given namespace
+func (r *IngressReconciler) applyReferenceGrant(ctx context.Context, ingressNamespace string) error {
+	logger := log.FromContext(ctx)
+	trans := r.getTranslator()
+
+	// Create ReferenceGrant using translator
+	refGrant := trans.CreateReferenceGrant(ingressNamespace)
+
+	// Check if ReferenceGrant exists
+	existing := &gatewayv1beta1.ReferenceGrant{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: ingressNamespace,
+		Name:      translator.ReferenceGrantName,
+	}, existing)
+
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Create new ReferenceGrant
+			logger.Info("Creating ReferenceGrant", "namespace", ingressNamespace, "name", translator.ReferenceGrantName)
+			if err := r.Create(ctx, refGrant); err != nil {
+				return fmt.Errorf("failed to create ReferenceGrant: %w", err)
+			}
+			return nil
+		}
+		return err
+	}
+
+	// Update existing ReferenceGrant if managed by us
+	if r.isManagedByUs(existing) {
+		existing.Spec = refGrant.Spec
+		logger.Info("Updating ReferenceGrant", "namespace", ingressNamespace, "name", translator.ReferenceGrantName)
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("failed to update ReferenceGrant: %w", err)
+		}
+	} else {
+		logger.Info("ReferenceGrant exists but is not managed by us, skipping",
+			"namespace", ingressNamespace, "name", translator.ReferenceGrantName)
 	}
 
 	return nil

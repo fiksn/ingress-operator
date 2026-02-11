@@ -40,6 +40,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/fiksn/ingress-operator/internal/controller"
 	// +kubebuilder:scaffold:imports
@@ -63,6 +64,7 @@ const (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(gatewayv1.Install(scheme))
+	utilruntime.Must(gatewayv1beta1.Install(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -106,10 +108,11 @@ func main() {
 	flag.BoolVar(&enableDeletion, "enable-deletion", false,
 		"If true, delete HTTPRoute (and Gateway in one-gateway-per-ingress mode) when Ingress is deleted")
 	flag.StringVar(&hostnameRewriteFrom, "hostname-rewrite-from", "",
-		"Domain suffix to match for rewriting (e.g., 'domain.cc'). Used with --hostname-rewrite-to.")
+		"Comma-separated list of domain suffixes to match for rewriting (e.g., 'domain.cc,other.com'). "+
+			"Used with --hostname-rewrite-to.")
 	flag.StringVar(&hostnameRewriteTo, "hostname-rewrite-to", "",
-		"Replacement domain suffix (e.g., 'foo.domain.cc'). "+
-			"Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc' to avoid DNS conflicts.")
+		"Comma-separated list of replacement domain suffixes (e.g., 'foo.domain.cc,bar.other.com'). "+
+			"Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'. Must have same number of items as --hostname-rewrite-from.")
 	flag.BoolVar(&disableSourceIngress, "disable-source-ingress", false,
 		"If true, disable the source Ingress by removing its ingressClassName to prevent nginx-ingress from processing it")
 	flag.StringVar(&gatewayAnnotations, "gateway-annotations", DefaultGatewayAnnotations,
@@ -353,9 +356,22 @@ func main() {
 	}
 
 	if hostnameRewriteFrom != "" && hostnameRewriteTo != "" {
-		setupLog.Info("Hostname rewriting enabled", "from", hostnameRewriteFrom, "to", hostnameRewriteTo)
+		// Validate that both lists have the same number of items
+		fromParts := strings.Split(hostnameRewriteFrom, ",")
+		toParts := strings.Split(hostnameRewriteTo, ",")
+		if len(fromParts) != len(toParts) {
+			setupLog.Error(nil,
+				"--hostname-rewrite-from and --hostname-rewrite-to must have same number of items",
+				"from-count", len(fromParts), "to-count", len(toParts))
+			os.Exit(1)
+		}
+		setupLog.Info("Hostname rewriting enabled",
+			"from", hostnameRewriteFrom,
+			"to", hostnameRewriteTo,
+			"rules", len(fromParts))
 	} else if hostnameRewriteFrom != "" || hostnameRewriteTo != "" {
-		setupLog.Error(nil, "Both --hostname-rewrite-from and --hostname-rewrite-to must be specified together")
+		setupLog.Error(nil,
+			"Both --hostname-rewrite-from and --hostname-rewrite-to must be specified together")
 		os.Exit(1)
 	}
 
@@ -375,6 +391,12 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
+
+	// Log when metrics server is ready
+	if metricsAddr != "0" {
+		setupLog.Info("Serving metrics server", "addr", metricsAddr, "secure", secureMetrics)
+	}
+
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)

@@ -28,8 +28,8 @@ import (
 )
 
 const (
-	certmanagerVersion = "v1.19.1"
-	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+	gatewayAPIVersion = "v1.2.1"
+	gatewayAPIURLTmpl = "https://github.com/kubernetes-sigs/gateway-api/releases/download/%s/standard-install.yaml"
 
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
@@ -59,58 +59,41 @@ func Run(cmd *exec.Cmd) (string, error) {
 	return string(output), nil
 }
 
-// UninstallCertManager uninstalls the cert manager
-func UninstallCertManager() {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
+// UninstallGatewayAPI uninstalls the Gateway API CRDs
+func UninstallGatewayAPI() {
+	url := fmt.Sprintf(gatewayAPIURLTmpl, gatewayAPIVersion)
+	cmd := exec.Command("kubectl", "delete", "-f", url, "--ignore-not-found")
 	if _, err := Run(cmd); err != nil {
 		warnError(err)
 	}
-
-	// Delete leftover leases in kube-system (not cleaned by default)
-	kubeSystemLeases := []string{
-		"cert-manager-cainjector-leader-election",
-		"cert-manager-controller",
-	}
-	for _, lease := range kubeSystemLeases {
-		cmd = exec.Command("kubectl", "delete", "lease", lease,
-			"-n", "kube-system", "--ignore-not-found", "--force", "--grace-period=0")
-		if _, err := Run(cmd); err != nil {
-			warnError(err)
-		}
-	}
 }
 
-// InstallCertManager installs the cert manager bundle.
-func InstallCertManager() error {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
+// InstallGatewayAPI installs the Gateway API CRDs bundle.
+func InstallGatewayAPI() error {
+	url := fmt.Sprintf(gatewayAPIURLTmpl, gatewayAPIVersion)
 	cmd := exec.Command("kubectl", "apply", "-f", url)
 	if _, err := Run(cmd); err != nil {
 		return err
 	}
-	// Wait for cert-manager-webhook to be ready, which can take time if cert-manager
-	// was re-installed after uninstalling on a cluster.
-	cmd = exec.Command("kubectl", "wait", "deployment.apps/cert-manager-webhook",
-		"--for", "condition=Available",
-		"--namespace", "cert-manager",
-		"--timeout", "5m",
+	// Wait for Gateway API CRDs to be established
+	cmd = exec.Command("kubectl", "wait", "--for=condition=Established",
+		"crd/gateways.gateway.networking.k8s.io",
+		"crd/httproutes.gateway.networking.k8s.io",
+		"--timeout", "2m",
 	)
 
 	_, err := Run(cmd)
 	return err
 }
 
-// IsCertManagerCRDsInstalled checks if any Cert Manager CRDs are installed
-// by verifying the existence of key CRDs related to Cert Manager.
-func IsCertManagerCRDsInstalled() bool {
-	// List of common Cert Manager CRDs
-	certManagerCRDs := []string{
-		"certificates.cert-manager.io",
-		"issuers.cert-manager.io",
-		"clusterissuers.cert-manager.io",
-		"certificaterequests.cert-manager.io",
-		"orders.acme.cert-manager.io",
-		"challenges.acme.cert-manager.io",
+// IsGatewayAPICRDsInstalled checks if any Gateway API CRDs are installed
+// by verifying the existence of key CRDs related to Gateway API.
+func IsGatewayAPICRDsInstalled() bool {
+	// List of core Gateway API CRDs
+	gatewayAPICRDs := []string{
+		"gateways.gateway.networking.k8s.io",
+		"gatewayclasses.gateway.networking.k8s.io",
+		"httproutes.gateway.networking.k8s.io",
 	}
 
 	// Execute the kubectl command to get all CRDs
@@ -120,9 +103,9 @@ func IsCertManagerCRDsInstalled() bool {
 		return false
 	}
 
-	// Check if any of the Cert Manager CRDs are present
+	// Check if any of the Gateway API CRDs are present
 	crdList := GetNonEmptyLines(output)
-	for _, crd := range certManagerCRDs {
+	for _, crd := range gatewayAPICRDs {
 		for _, line := range crdList {
 			if strings.Contains(line, crd) {
 				return true

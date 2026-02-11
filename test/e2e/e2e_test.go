@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -63,10 +64,9 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
 
-		By("installing CRDs")
+		By("checking for operator CRDs (ingress-operator has no custom CRDs)")
 		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+		_, _ = utils.Run(cmd) // This will output "No CRDs to install" - that's expected
 
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
@@ -83,10 +83,6 @@ var _ = Describe("Manager", Ordered, func() {
 
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
 		_, _ = utils.Run(cmd)
 
 		By("removing manager namespace")
@@ -268,15 +264,78 @@ var _ = Describe("Manager", Ordered, func() {
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+		It("should translate Ingress to Gateway API resources", func() {
+			testNamespace := "test-ingress-translation"
+
+			By("creating test namespace")
+			cmd := exec.Command("kubectl", "create", "ns", testNamespace)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create test namespace")
+
+			By("creating the gateway namespace if it doesn't exist")
+			cmd = exec.Command("kubectl", "create", "ns", "nginx-fabric")
+			_, _ = utils.Run(cmd) // Ignore error if already exists
+
+			By("creating a sample Ingress resource")
+			sampleIngress := `
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sample-ingress
+  namespace: ` + testNamespace + `
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: test.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: test-service
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - test.example.com
+    secretName: test-tls
+`
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(sampleIngress)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create sample Ingress")
+
+			By("verifying Gateway resource is created")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "gateway", "nginx", "-n", "nginx-fabric", "-o", "json")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Gateway should be created")
+				g.Expect(output).To(ContainSubstring("test.example.com"), "Gateway should have the hostname")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("verifying HTTPRoute resource is created")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "httproute", "sample-ingress", "-n", testNamespace, "-o", "json")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "HTTPRoute should be created")
+				g.Expect(output).To(ContainSubstring("test.example.com"), "HTTPRoute should have the hostname")
+				g.Expect(output).To(ContainSubstring("test-service"), "HTTPRoute should reference the backend service")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("verifying managed-by annotations are present")
+			cmd = exec.Command("kubectl", "get", "gateway", "nginx", "-n", "nginx-fabric",
+				"-o", "jsonpath={.metadata.annotations.ingress-operator\\.fiction\\.si/managed-by}")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("ingress-controller"), "Gateway should have managed-by annotation")
+
+			By("cleaning up test resources")
+			cmd = exec.Command("kubectl", "delete", "ns", testNamespace)
+			_, _ = utils.Run(cmd)
+		})
 	})
 })
 
