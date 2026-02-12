@@ -104,6 +104,10 @@ func main() {
 	var ingressClassFilter string
 	var ingressClassSnippetsFilters string
 	var reconcileCachePersist bool
+	var useIngress2Gateway bool
+	var ingress2GatewayProvider string
+	var ingress2GatewayIngressClass string
+
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "nginx-fabric",
 		"The namespace where the Gateway resource will be created")
 	flag.StringVar(&gatewayName, "gateway-name", "ingress-gateway",
@@ -150,9 +154,6 @@ func main() {
 	flag.StringVar(&httpRouteAnnotationFilters, "httproute-annotation-filters",
 		controller.DefaultHTTPRouteAnnotationFilters,
 		"Comma-separated list of annotation prefixes to exclude from HTTPRoute resources")
-	var useIngress2Gateway bool
-	var ingress2GatewayProvider string
-	var ingress2GatewayIngressClass string
 	flag.BoolVar(&useIngress2Gateway, "use-ingress2gateway", false,
 		"If true, use the ingress2gateway library for translation (disables hostname/certificate mangling)")
 	flag.StringVar(&ingress2GatewayProvider, "ingress2gateway-provider", "ingress-nginx",

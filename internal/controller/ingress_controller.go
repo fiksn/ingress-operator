@@ -25,6 +25,7 @@ import (
 
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -219,21 +220,21 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if r.OneGatewayPerIngress {
 		// Mode: One Gateway per Ingress
-		result, err := r.reconcileOneGatewayPerIngress(ctx, ingressList.Items)
-		r.maybeRecordReconcile(&ingress, result, err)
-		return result, err
+		result := r.reconcileOneGatewayPerIngress(ctx, ingressList.Items)
+		r.maybeRecordReconcile(&ingress, result, nil)
+		return result, nil
 	}
 
 	// Mode: Shared Gateways (group by IngressClass)
-	result, err := r.reconcileSharedGateways(ctx, ingressList.Items)
-	r.maybeRecordReconcile(&ingress, result, err)
-	return result, err
+	result := r.reconcileSharedGateways(ctx, ingressList.Items)
+	r.maybeRecordReconcile(&ingress, result, nil)
+	return result, nil
 }
 
 func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 	ctx context.Context,
 	ingresses []networkingv1.Ingress,
-) (ctrl.Result, error) {
+) ctrl.Result {
 	logger := log.FromContext(ctx)
 	trans := r.getTranslator()
 	hadError := false
@@ -250,6 +251,10 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 			logger.Error(err, "failed to translate Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
 			hadError = true
 			continue
+		}
+
+		if r.IngressPostProcessingMode != IngressPostProcessingModeRemove {
+			setGatewayOwnerReference(gateway, &ingress)
 		}
 
 		r.applyHTTPRouteExtensionRefs(ctx, &ingress, httpRoute)
@@ -298,16 +303,16 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 	}
 
 	if hadError {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterError}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}
 }
 
 func (r *IngressReconciler) reconcileSharedGateways(
 	ctx context.Context,
 	ingresses []networkingv1.Ingress,
-) (ctrl.Result, error) {
+) ctrl.Result {
 	logger := log.FromContext(ctx)
 	hadError := false
 
@@ -396,10 +401,10 @@ func (r *IngressReconciler) reconcileSharedGateways(
 	}
 
 	if hadError {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterError}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}
 }
 
 func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
@@ -506,12 +511,16 @@ func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 				logger.Info("nginx ingress annotation warning", "warning", warning, "namespace", ingress.Namespace, "name", ingress.Name)
 			}
 			filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
+			var owner client.Object = ingress
+			if r.IngressPostProcessingMode == IngressPostProcessingModeRemove {
+				owner = nil
+			}
 			ready, err := utils.EnsureSnippetsFilterForIngress(
 				ctx,
 				r.Client,
 				r.Scheme,
 				httpRoute,
-				ingress,
+				owner,
 				ingress.Namespace,
 				ingress.Name,
 				filterName,
@@ -885,6 +894,9 @@ func (r *IngressReconciler) applyGateway(
 	// This allows multiple operator instances watching different namespaces to share the same Gateway
 	for attempt := 0; attempt < 3; attempt++ {
 		translator.MergeGatewaySpec(existing, desired)
+		if len(desired.OwnerReferences) > 0 {
+			existing.OwnerReferences = desired.OwnerReferences
+		}
 
 		logger.V(1).Info("Updating Gateway", "namespace", existing.Namespace, "name", existing.Name)
 		if err := r.Update(ctx, existing); err != nil {
@@ -1003,4 +1015,22 @@ func NamespaceFilter(namespace string) predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return obj.GetNamespace() == namespace
 	})
+}
+
+func setGatewayOwnerReference(gateway *gatewayv1.Gateway, ingress *networkingv1.Ingress) {
+	if gateway == nil || ingress == nil {
+		return
+	}
+	controller := true
+	blockOwnerDeletion := false
+	gateway.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion:         ingress.APIVersion,
+			Kind:               ingress.Kind,
+			Name:               ingress.Name,
+			UID:                ingress.UID,
+			Controller:         &controller,
+			BlockOwnerDeletion: &blockOwnerDeletion,
+		},
+	}
 }
