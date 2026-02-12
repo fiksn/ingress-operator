@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"strings"
@@ -37,6 +38,7 @@ import (
 
 	_ "github.com/fiksn/ingress-doperator/internal/metrics" // Import to register metrics
 	"github.com/fiksn/ingress-doperator/internal/translator"
+	"github.com/fiksn/ingress-doperator/internal/utils"
 	webhookhandler "github.com/fiksn/ingress-doperator/internal/webhook"
 )
 
@@ -63,6 +65,7 @@ func main() {
 	var gatewayAnnotations string
 	var gatewayAnnotationFilters string
 	var httpRouteAnnotationFilters string
+	var ingressClassSnippetsFilters string
 	var useIngress2Gateway bool
 	var ingressClassFilter string
 
@@ -85,6 +88,9 @@ func main() {
 		"Comma-separated list of replacement domain suffixes (must match count of --hostname-rewrite-from)")
 	flag.StringVar(&gatewayAnnotations, "gateway-annotations", "",
 		"Comma-separated key=value pairs for Gateway metadata annotations")
+	flag.StringVar(&ingressClassSnippetsFilters, "ingress-class-snippets-filter", "",
+		"Comma-separated list of pattern:snippetsFilterName entries. "+
+			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
 	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",
 		"ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,"+
 			"kubectl.kubernetes.io,kubernetes.io/ingress.class,ingress-doperator.fiction.si",
@@ -113,6 +119,12 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	parsedSnippetsFilters, err := utils.ParseIngressClassSnippetsFilters(ingressClassSnippetsFilters)
+	if err != nil {
+		setupLog.Error(err, "Invalid ingress-class-snippets-filter value")
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -127,6 +139,13 @@ func main() {
 	if err != nil {
 		setupLog.Error(err, "unable to start webhook")
 		os.Exit(1)
+	}
+
+	for _, mapping := range parsedSnippetsFilters {
+		if err := utils.ValidateSnippetsFilterExists(context.Background(), mgr.GetClient(), gatewayNamespace, mapping.Name); err != nil {
+			setupLog.Error(err, "SnippetsFilter not found in gateway namespace", "name", mapping.Name, "namespace", gatewayNamespace)
+			os.Exit(1)
+		}
 	}
 
 	// Parse gateway annotations
@@ -176,9 +195,14 @@ func main() {
 
 	// Register webhook
 	mutator := &webhookhandler.IngressMutator{
-		Client:             mgr.GetClient(),
-		Translator:         trans,
-		IngressClassFilter: ingressClassFilter,
+		Client:                      mgr.GetClient(),
+		Scheme:                      mgr.GetScheme(),
+		Translator:                  trans,
+		IngressClassFilter:          ingressClassFilter,
+		IngressClassSnippetsFilters: parsedSnippetsFilters,
+		HTTPRouteManager: &utils.HTTPRouteManager{
+			Client: mgr.GetClient(),
+		},
 	}
 
 	mgr.GetWebhookServer().Register("/mutate-v1-ingress",

@@ -23,9 +23,12 @@ import (
 
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/fiksn/ingress-doperator/internal/translator"
@@ -35,6 +38,7 @@ import (
 func EnsureReferenceGrants(
 	ctx context.Context,
 	c client.Client,
+	scheme *runtime.Scheme,
 	trans *translator.Translator,
 	ingresses []networkingv1.Ingress,
 	recordMetric func(operation, namespace, name string),
@@ -46,7 +50,7 @@ func EnsureReferenceGrants(
 
 	// Create ReferenceGrant in each namespace
 	for _, namespace := range namespacesWithTLS {
-		if err := ApplyReferenceGrant(ctx, c, trans, namespace, recordMetric); err != nil {
+		if err := ApplyReferenceGrant(ctx, c, scheme, trans, namespace, recordMetric); err != nil {
 			logger.Error(err, "failed to apply ReferenceGrant", "namespace", namespace)
 			return err
 		}
@@ -130,6 +134,7 @@ func CleanupReferenceGrantIfNeeded(
 func ApplyReferenceGrant(
 	ctx context.Context,
 	c client.Client,
+	scheme *runtime.Scheme,
 	trans *translator.Translator,
 	ingressNamespace string,
 	recordMetric func(operation, namespace, name string),
@@ -152,6 +157,15 @@ func ApplyReferenceGrant(
 
 	// Create ReferenceGrant using translator with source tracking
 	refGrant := trans.CreateReferenceGrant(ingressNamespace, ingressesWithTLS)
+	if scheme != nil && len(ingressesWithTLS) == 1 {
+		owner := &gatewayv1.HTTPRoute{}
+		ownerName := ingressesWithTLS[0].Name
+		if err := c.Get(ctx, types.NamespacedName{Namespace: ingressNamespace, Name: ownerName}, owner); err == nil {
+			if err := controllerutil.SetControllerReference(owner, refGrant, scheme); err != nil {
+				return err
+			}
+		}
+	}
 
 	// Check if ReferenceGrant exists
 	existing := &gatewayv1beta1.ReferenceGrant{}

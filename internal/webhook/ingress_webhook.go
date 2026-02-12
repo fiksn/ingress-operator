@@ -24,9 +24,11 @@ import (
 	"path/filepath"
 
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/fiksn/ingress-doperator/internal/metrics"
 	"github.com/fiksn/ingress-doperator/internal/translator"
@@ -43,11 +45,13 @@ const (
 
 // IngressMutator handles Ingress mutations
 type IngressMutator struct {
-	Client             client.Client
-	decoder            admission.Decoder
-	Translator         *translator.Translator
-	IngressClassFilter string
-	HTTPRouteManager   *utils.HTTPRouteManager
+	Client                      client.Client
+	decoder                     admission.Decoder
+	Scheme                      *runtime.Scheme
+	Translator                  *translator.Translator
+	IngressClassFilter          string
+	IngressClassSnippetsFilters []utils.IngressClassSnippetsFilter
+	HTTPRouteManager            *utils.HTTPRouteManager
 }
 
 // Handle performs the mutation
@@ -119,10 +123,15 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 	metricRecorder := func(operation, namespace, name string) {
 		metrics.HTTPRouteResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
 	}
+
+	m.applyIngressClassSnippetsFilters(ctx, ingress, httpRoutes)
+	m.applyIngressAnnotationSnippetsFilter(ctx, ingress, httpRoutes)
 	if err := m.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, ingress, httpRoutes, metricRecorder); err != nil {
 		logger.Error(err, "failed to apply HTTPRoutes")
 		// Don't fail the admission, just log
 	}
+	m.finalizeIngressClassSnippetsFilters(ctx, ingress)
+	m.finalizeIngressAnnotationSnippetsFilter(ctx, ingress)
 
 	// Create ReferenceGrant if needed (when Ingress has TLS and Gateway is in different namespace)
 	// Skip in ingress2gateway mode as it handles this itself
@@ -131,7 +140,7 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		recordMetric := func(operation, namespace, name string) {
 			metrics.ReferenceGrantResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
 		}
-		if err := utils.ApplyReferenceGrant(ctx, m.Client, m.Translator, ingress.Namespace, recordMetric); err != nil {
+		if err := utils.ApplyReferenceGrant(ctx, m.Client, m.Scheme, m.Translator, ingress.Namespace, recordMetric); err != nil {
 			logger.Error(err, "failed to apply ReferenceGrant", "namespace", ingress.Namespace)
 			// Don't fail the admission, just log
 		} else {
@@ -172,6 +181,164 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 func (m *IngressMutator) InjectDecoder(d *admission.Decoder) error {
 	m.decoder = *d
 	return nil
+}
+
+func (m *IngressMutator) applyIngressClassSnippetsFilters(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	httpRoutes []*gatewayv1.HTTPRoute,
+) {
+	if ingress == nil || len(httpRoutes) == 0 || len(m.IngressClassSnippetsFilters) == 0 {
+		return
+	}
+
+	logger := log.FromContext(ctx)
+	ingressClass := m.getIngressClass(ingress)
+	matchedFilters := make([]utils.IngressClassSnippetsFilter, 0, len(m.IngressClassSnippetsFilters))
+	for _, mapping := range m.IngressClassSnippetsFilters {
+		matched, err := filepath.Match(mapping.Pattern, ingressClass)
+		if err != nil {
+			logger.Error(err, "invalid ingress class pattern for snippets filter", "pattern", mapping.Pattern)
+			continue
+		}
+		if matched {
+			matchedFilters = append(matchedFilters, mapping)
+		}
+	}
+
+	if len(matchedFilters) == 0 {
+		return
+	}
+
+	for _, route := range httpRoutes {
+		for _, mapping := range matchedFilters {
+			utils.AddExtensionRefFilterAfterExistingKind(route, utils.NginxGatewayGroup, utils.SnippetsFilterKind, mapping.Name)
+		}
+	}
+
+	for _, mapping := range matchedFilters {
+		if _, err := utils.EnsureSnippetsFilterCopyForHTTPRoute(
+			ctx,
+			m.Client,
+			m.Scheme,
+			m.Translator.Config.GatewayNamespace,
+			ingress.Namespace,
+			ingress.Namespace,
+			ingress.Name,
+			mapping.Name,
+			"",
+		); err != nil {
+			logger.Error(err, "failed to copy class-based SnippetsFilter", "name", mapping.Name, "namespace", ingress.Namespace)
+		}
+	}
+}
+
+func (m *IngressMutator) finalizeIngressClassSnippetsFilters(ctx context.Context, ingress *networkingv1.Ingress) {
+	if ingress == nil || len(m.IngressClassSnippetsFilters) == 0 {
+		return
+	}
+	logger := log.FromContext(ctx)
+	ingressClass := m.getIngressClass(ingress)
+	for _, mapping := range m.IngressClassSnippetsFilters {
+		matched, err := filepath.Match(mapping.Pattern, ingressClass)
+		if err != nil {
+			logger.Error(err, "invalid ingress class pattern for snippets filter", "pattern", mapping.Pattern)
+			continue
+		}
+		if !matched {
+			continue
+		}
+		if _, err := utils.EnsureSnippetsFilterCopyForHTTPRoute(
+			ctx,
+			m.Client,
+			m.Scheme,
+			m.Translator.Config.GatewayNamespace,
+			ingress.Namespace,
+			ingress.Namespace,
+			ingress.Name,
+			mapping.Name,
+			ingress.Name,
+		); err != nil {
+			logger.Error(err, "failed to finalize class-based SnippetsFilter owner reference", "name", mapping.Name, "namespace", ingress.Namespace)
+		}
+	}
+}
+
+func (m *IngressMutator) applyIngressAnnotationSnippetsFilter(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	httpRoutes []*gatewayv1.HTTPRoute,
+) {
+	if ingress == nil || len(httpRoutes) == 0 {
+		return
+	}
+
+	logger := log.FromContext(ctx)
+	if ingress.Annotations != nil {
+		for _, fullKey := range utils.NginxIngressSnippetWarningAnnotations(ingress.Annotations) {
+			logger.Info("Ignoring nginx ingress annotation; use ingress-doperator.fiction.si/httproute-snippets-filter instead",
+				"annotation", fullKey,
+				"namespace", ingress.Namespace,
+				"name", ingress.Name)
+		}
+	}
+
+	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations)
+	if !ok {
+		return
+	}
+	for _, warning := range warnings {
+		logger.Info("nginx ingress annotation warning", "warning", warning, "namespace", ingress.Namespace, "name", ingress.Name)
+	}
+
+	filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
+	if _, err := utils.EnsureSnippetsFilterForIngress(
+		ctx,
+		m.Client,
+		m.Scheme,
+		httpRoutes[0],
+		nil,
+		ingress.Namespace,
+		ingress.Name,
+		filterName,
+		snippets,
+	); err != nil {
+		logger.Error(err, "failed to apply annotation SnippetsFilter", "name", filterName, "namespace", ingress.Namespace)
+		return
+	}
+
+	for _, route := range httpRoutes {
+		utils.AddExtensionRefFilterAfterExistingKind(route, utils.NginxGatewayGroup, utils.SnippetsFilterKind, filterName)
+	}
+}
+
+func (m *IngressMutator) finalizeIngressAnnotationSnippetsFilter(ctx context.Context, ingress *networkingv1.Ingress) {
+	if ingress == nil {
+		return
+	}
+	logger := log.FromContext(ctx)
+	snippets, _, ok := utils.BuildNginxIngressSnippets(ingress.Annotations)
+	if !ok {
+		return
+	}
+	owner := &gatewayv1.HTTPRoute{}
+	if err := m.Client.Get(ctx, client.ObjectKey{Namespace: ingress.Namespace, Name: ingress.Name}, owner); err != nil {
+		return
+	}
+	filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
+	if _, err := utils.EnsureSnippetsFilterForIngress(
+		ctx,
+		m.Client,
+		m.Scheme,
+		owner,
+		owner,
+		ingress.Namespace,
+		ingress.Name,
+		filterName,
+		snippets,
+	); err != nil {
+		logger.Error(err, "failed to finalize annotation SnippetsFilter owner reference", "name", filterName, "namespace", ingress.Namespace)
+	}
 }
 
 // getIngressClass returns the ingress class from spec.ingressClassName or the legacy annotation

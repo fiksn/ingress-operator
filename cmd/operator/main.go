@@ -29,6 +29,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -65,6 +66,7 @@ const (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 	utilruntime.Must(gatewayv1.Install(scheme))
 	utilruntime.Must(gatewayv1beta1.Install(scheme))
 
@@ -98,6 +100,7 @@ func main() {
 	var privateAnnotations string
 	var privateIngressClassPattern string
 	var ingressClassFilter string
+	var ingressClassSnippetsFilters string
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "nginx-fabric",
 		"The namespace where the Gateway resource will be created")
 	flag.StringVar(&gatewayName, "gateway-name", "ingress-gateway",
@@ -118,7 +121,8 @@ func main() {
 			"Used with --hostname-rewrite-to.")
 	flag.StringVar(&hostnameRewriteTo, "hostname-rewrite-to", "",
 		"Comma-separated list of replacement domain suffixes (e.g., 'foo.domain.cc,bar.other.com'). "+
-			"Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'. Must have same number of items as --hostname-rewrite-from.")
+			"Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'. "+
+			"Must have same number of items as --hostname-rewrite-from.")
 	flag.StringVar(&ingressPostProcessing, "ingress-postprocessing", "none",
 		"How to handle the post processing of ingress: 'none' (no action), "+
 			"'disable' (remove ingress class), 'remove' (delete ingress)")
@@ -132,6 +136,9 @@ func main() {
 	flag.BoolVar(&private, "private", false, "If true, apply private annotations to all Gateways")
 	flag.StringVar(&privateIngressClassPattern, "private-ingress-class-pattern", "*private*",
 		"Glob pattern for ingress class names (e.g., '*private') that should get private infrastructure annotations")
+	flag.StringVar(&ingressClassSnippetsFilters, "ingress-class-snippets-filter", "",
+		"Comma-separated list of pattern:snippetsFilterName entries. "+
+			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
 	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",
 		controller.DefaultGatewayAnnotationFilters,
 		"Comma-separated list of annotation prefixes to exclude from Gateway resources")
@@ -171,6 +178,12 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	parsedSnippetsFilters, err := utils.ParseIngressClassSnippetsFilters(ingressClassSnippetsFilters)
+	if err != nil {
+		setupLog.Error(err, "Invalid ingress-class-snippets-filter value")
+		os.Exit(1)
+	}
 
 	var ingressPostProcessingMode controller.IngressPostProcessingMode
 	switch ingressPostProcessing {
@@ -289,6 +302,13 @@ func main() {
 	}
 	setupLog.Info("Verified Gateway namespace exists", "namespace", gatewayNamespace)
 
+	for _, mapping := range parsedSnippetsFilters {
+		if err := utils.ValidateSnippetsFilterExists(ctx, mgr.GetClient(), gatewayNamespace, mapping.Name); err != nil {
+			setupLog.Error(err, "SnippetsFilter not found in gateway namespace", "name", mapping.Name, "namespace", gatewayNamespace)
+			os.Exit(1)
+		}
+	}
+
 	// Parse annotation filters
 	var gatewayFilters []string
 	if gatewayAnnotationFilters != "" {
@@ -352,6 +372,7 @@ func main() {
 		ApplyPrivateToAll:                private,
 		PrivateIngressClassPattern:       privateIngressClassPattern,
 		IngressClassFilter:               ingressClassFilter,
+		IngressClassSnippetsFilters:      parsedSnippetsFilters,
 		UseIngress2Gateway:               useIngress2Gateway,
 		Ingress2GatewayProvider:          ingress2GatewayProvider,
 		Ingress2GatewayIngressClass:      ingress2GatewayIngressClass,

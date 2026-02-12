@@ -44,6 +44,9 @@ const (
 	OriginalIngressClassAnnotation     = "ingress-doperator.fiction.si/original-ingress-class"
 	OriginalIngressClassNameAnnotation = "ingress-doperator.fiction.si/original-ingress-classname"
 	FinalizerName                      = "ingress-doperator.fiction.si/finalizer"
+	HTTPRouteSnippetsFilterAnnotation  = "ingress-doperator.fiction.si/httproute-snippets-filter"
+	HTTPRouteAuthenticationAnnotation  = "ingress-doperator.fiction.si/httproute-authentication-filter"
+	HTTPRouteRequestHeaderAnnotation   = "ingress-doperator.fiction.si/httproute-request-header-modifier-filter"
 	DefaultGatewayAnnotationFilters    = "ingress.kubernetes.io,cert-manager.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
@@ -88,6 +91,7 @@ type IngressReconciler struct {
 	Ingress2GatewayProvider          string
 	Ingress2GatewayIngressClass      string
 	HTTPRouteManager                 *utils.HTTPRouteManager
+	IngressClassSnippetsFilters      []utils.IngressClassSnippetsFilter
 }
 
 // getTranslator creates a translator instance with the reconciler's configuration
@@ -220,6 +224,8 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 			continue
 		}
 
+		r.applyHTTPRouteExtensionRefs(ctx, &ingress, httpRoute)
+
 		// Check if we can manage the Gateway resource
 		gatewayNN := types.NamespacedName{
 			Namespace: gateway.Namespace,
@@ -299,20 +305,6 @@ func (r *IngressReconciler) reconcileSharedGateways(
 				continue
 			}
 			logger.Info("Gateway applied successfully", "namespace", gateway.Namespace, "name", gateway.Name)
-
-			// Create ReferenceGrants for cross-namespace secret access
-			// Only needed when Gateway is in different namespace than Ingress secrets
-			// Skip in ingress2gateway mode as it handles this itself
-			if !r.UseIngress2Gateway {
-				trans := r.getTranslator()
-				recordMetric := func(operation, namespace, name string) {
-					metrics.ReferenceGrantResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
-				}
-				if err := utils.EnsureReferenceGrants(ctx, r.Client, trans, classIngresses, recordMetric); err != nil {
-					logger.Error(err, "failed to ensure ReferenceGrants")
-					// Don't fail the reconciliation, just log the error
-				}
-			}
 		} else {
 			logger.Info("Skipping Gateway synthesis - resource exists and is not managed by us",
 				"namespace", gatewayNN.Namespace, "name", gatewayNN.Name)
@@ -326,6 +318,8 @@ func (r *IngressReconciler) reconcileSharedGateways(
 			classTrans := translator.New(transConfig)
 
 			httpRoute := classTrans.TranslateToHTTPRoute(&ingress)
+
+			r.applyHTTPRouteExtensionRefs(ctx, &ingress, httpRoute)
 
 			// Resolve any named ports before applying
 			if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, &ingress, httpRoute); err != nil {
@@ -345,9 +339,146 @@ func (r *IngressReconciler) reconcileSharedGateways(
 				continue
 			}
 		}
+
+		// Create ReferenceGrants for cross-namespace secret access
+		// Only needed when Gateway is in different namespace than Ingress secrets
+		// Skip in ingress2gateway mode as it handles this itself
+		if !r.UseIngress2Gateway {
+			trans := r.getTranslator()
+			recordMetric := func(operation, namespace, name string) {
+				metrics.ReferenceGrantResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
+			}
+			if err := utils.EnsureReferenceGrants(ctx, r.Client, r.Scheme, trans, classIngresses, recordMetric); err != nil {
+				logger.Error(err, "failed to ensure ReferenceGrants")
+				// Don't fail the reconciliation, just log the error
+			}
+		}
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	httpRoute *gatewayv1.HTTPRoute,
+) {
+	logger := log.FromContext(ctx)
+	if ingress == nil || httpRoute == nil {
+		return
+	}
+
+	extensionRefs := []struct {
+		annotation string
+		kind       string
+		logName    string
+	}{
+		{HTTPRouteSnippetsFilterAnnotation, utils.SnippetsFilterKind, "SnippetsFilter"},
+		{HTTPRouteAuthenticationAnnotation, utils.AuthenticationFilterKind, "AuthenticationFilter"},
+		{HTTPRouteRequestHeaderAnnotation, utils.RequestHeaderModifierFilterKind, "RequestHeaderModifierFilter"},
+	}
+
+	for _, entry := range extensionRefs {
+		names := utils.ParseCommaSeparatedAnnotation(ingress.Annotations, entry.annotation)
+		if len(names) == 0 {
+			if entry.kind != utils.SnippetsFilterKind {
+				continue
+			}
+		}
+
+		available := make([]string, 0, len(names))
+		for _, name := range names {
+			ok, err := utils.EnsureExtensionResource(
+				ctx,
+				r.Client,
+				entry.kind,
+				name,
+				r.GatewayNamespace,
+				ingress.Namespace,
+				ingress.Namespace,
+				ingress.Name,
+				nil,
+			)
+			if err != nil {
+				logger.Error(err, "failed to apply extension resource copy", "kind", entry.logName, "name", name, "namespace", ingress.Namespace)
+				continue
+			}
+			if ok {
+				available = append(available, name)
+			}
+		}
+
+		if len(available) > 0 {
+			utils.AddExtensionRefFilters(httpRoute, utils.NginxGatewayGroup, entry.kind, available)
+		}
+
+		if entry.kind == utils.SnippetsFilterKind {
+			ingressClass := r.getIngressClass(ingress)
+			for _, mapping := range r.IngressClassSnippetsFilters {
+				matched, err := filepath.Match(mapping.Pattern, ingressClass)
+				if err != nil {
+					logger.Error(err, "invalid ingress class pattern for snippets filter", "pattern", mapping.Pattern)
+					continue
+				}
+				if !matched {
+					continue
+				}
+				ok, err := utils.EnsureSnippetsFilterCopyForHTTPRoute(
+					ctx,
+					r.Client,
+					r.Scheme,
+					r.GatewayNamespace,
+					httpRoute.Namespace,
+					ingress.Namespace,
+					ingress.Name,
+					mapping.Name,
+					httpRoute.Name,
+				)
+				if err != nil {
+					logger.Error(err, "failed to apply class-based SnippetsFilter copy", "name", mapping.Name, "namespace", ingress.Namespace)
+					continue
+				}
+				if ok {
+					utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, mapping.Name)
+				}
+			}
+
+			if ingress.Annotations != nil {
+				for _, fullKey := range utils.NginxIngressSnippetWarningAnnotations(ingress.Annotations) {
+					logger.Info("Ignoring nginx ingress annotation; use ingress-doperator.fiction.si/httproute-snippets-filter instead",
+						"annotation", fullKey,
+						"namespace", ingress.Namespace,
+						"name", ingress.Name)
+				}
+			}
+			snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations)
+			if !ok {
+				continue
+			}
+			for _, warning := range warnings {
+				logger.Info("nginx ingress annotation warning", "warning", warning, "namespace", ingress.Namespace, "name", ingress.Name)
+			}
+			filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
+			ready, err := utils.EnsureSnippetsFilterForIngress(
+				ctx,
+				r.Client,
+				r.Scheme,
+				httpRoute,
+				ingress,
+				ingress.Namespace,
+				ingress.Name,
+				filterName,
+				snippets,
+			)
+			if err != nil {
+				logger.Error(err, "failed to apply annotation SnippetsFilter", "name", filterName, "namespace", httpRoute.Namespace)
+				continue
+			}
+			if ready {
+				utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, filterName)
+			}
+		}
+	}
 }
 
 func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *networkingv1.Ingress) (ctrl.Result, error) {
