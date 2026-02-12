@@ -911,8 +911,6 @@ func (r *IngressReconciler) applyGateway(
 	}
 
 	return fmt.Errorf("failed to update Gateway after retries")
-
-	return nil
 }
 
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
