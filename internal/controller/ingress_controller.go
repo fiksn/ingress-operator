@@ -368,6 +368,12 @@ func (r *IngressReconciler) reconcileSharedGateways(
 
 	// For each IngressClass, create a Gateway by merging listeners from all ingresses
 	for ingressClass, classIngresses := range ingressesByClass {
+		if ingressClass == DisabledIngressClassName {
+			logger.Info("Refusing to create disabled gateway",
+				"gatewayName", ingressClass,
+				"ingressCount", len(classIngresses))
+			continue
+		}
 		gatewayName := r.getGatewayNameForClass(ingressClass)
 
 		// Create a merged Gateway from all ingresses in this class using translator

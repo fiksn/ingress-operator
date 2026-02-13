@@ -545,14 +545,14 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 
 	serverLines := append([]string{}, lines...)
 	if state.browserXssFilter {
-		serverLines = append(serverLines, "more_set_headers \"X-XSS-Protection: 1; mode=block\";")
+		serverLines = append(serverLines, "add_header X-XSS-Protection \"1; mode=block\" always;")
 	}
 	if state.contentTypeNosniff {
-		serverLines = append(serverLines, "more_set_headers \"X-Content-Type-Options: nosniff\";")
+		serverLines = append(serverLines, "add_header X-Content-Type-Options \"nosniff\" always;")
 	}
 	if strings.TrimSpace(state.referrerPolicy) != "" {
 		serverLines = append(serverLines,
-			fmt.Sprintf("more_set_headers \"Referrer-Policy: %s\";", escapeHeaderValue(state.referrerPolicy)))
+			fmt.Sprintf("add_header Referrer-Policy %q always;", escapeHeaderValue(state.referrerPolicy)))
 	}
 	if state.forceSSLRedirect {
 		redirectTarget := "https://$server_name$request_uri"
@@ -573,7 +573,7 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 			)
 		}
 		serverLines = append(serverLines,
-			"more_set_headers \"Strict-Transport-Security: max-age=31536000\";",
+			"add_header Strict-Transport-Security \"max-age=31536000\" always;",
 			fmt.Sprintf("if ($ingress_doperator_needs_redirect = 1) { return 308 %s; }", redirectTarget),
 		)
 	}
