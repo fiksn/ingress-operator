@@ -19,6 +19,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -160,6 +161,90 @@ func ParseIngressClassSnippetsFilters(raw string) ([]IngressClassSnippetsFilter,
 		})
 	}
 	return out, nil
+}
+
+type IngressAnnotationSnippetsRule struct {
+	AnnotationKey  string
+	ValuePattern   string
+	SnippetsFilter []string
+}
+
+func ParseIngressAnnotationSnippetsRules(raw string) ([]IngressAnnotationSnippetsRule, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	entries := strings.Split(raw, ";")
+	out := make([]IngressAnnotationSnippetsRule, 0, len(entries))
+	for _, entry := range entries {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
+			continue
+		}
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid entry %q, expected key=value:filter1,filter2", trimmed)
+		}
+		keyValue := strings.TrimSpace(parts[0])
+		filtersRaw := strings.TrimSpace(parts[1])
+		kv := strings.SplitN(keyValue, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid entry %q, expected key=value:filter1,filter2", trimmed)
+		}
+		key := strings.TrimSpace(kv[0])
+		valuePattern := strings.TrimSpace(kv[1])
+		if key == "" || valuePattern == "" || filtersRaw == "" {
+			return nil, fmt.Errorf("invalid entry %q, key, value and filters must be non-empty", trimmed)
+		}
+		filters := ParseCommaSeparatedAnnotation(map[string]string{"value": filtersRaw}, "value")
+		if len(filters) == 0 {
+			return nil, fmt.Errorf("invalid entry %q, filters list must be non-empty", trimmed)
+		}
+		out = append(out, IngressAnnotationSnippetsRule{
+			AnnotationKey:  key,
+			ValuePattern:   valuePattern,
+			SnippetsFilter: filters,
+		})
+	}
+	return out, nil
+}
+
+func MatchIngressAnnotationSnippetsRules(
+	annotations map[string]string,
+	rules []IngressAnnotationSnippetsRule,
+) []string {
+	if annotations == nil || len(rules) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	for _, rule := range rules {
+		if rule.AnnotationKey == "" || rule.ValuePattern == "" {
+			continue
+		}
+		value, ok := annotations[rule.AnnotationKey]
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		matched, err := filepath.Match(rule.ValuePattern, value)
+		if err != nil || !matched {
+			continue
+		}
+		for _, name := range rule.SnippetsFilter {
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // ParseCommaSeparatedAnnotation splits a comma-separated annotation value into unique entries.
@@ -860,6 +945,11 @@ func getCRDVersion(ctx context.Context, c client.Reader, crdName string) (string
 
 	crdVersionCache.Store(crdName, crdVersionCacheEntry{version: version})
 	return version, true, nil
+}
+
+// GetCRDVersion returns the storage/served version for a CRD name if installed.
+func GetCRDVersion(ctx context.Context, c client.Reader, crdName string) (string, bool, error) {
+	return getCRDVersion(ctx, c, crdName)
 }
 
 func pickCRDVersion(crd *apiextensionsv1.CustomResourceDefinition) (string, bool) {

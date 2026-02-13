@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -104,6 +105,9 @@ type IngressReconciler struct {
 	Ingress2GatewayIngressClass      string
 	HTTPRouteManager                 *utils.HTTPRouteManager
 	IngressClassSnippetsFilters      []utils.IngressClassSnippetsFilter
+	IngressNameSnippetsFilters       []utils.IngressClassSnippetsFilter
+	IngressAnnotationSnippetsAdd     []utils.IngressAnnotationSnippetsRule
+	IngressAnnotationSnippetsRemove  []utils.IngressAnnotationSnippetsRule
 	ReconcileCache                   map[string]utils.ReconcileCacheEntry
 	ReconcileCacheNamespace          string
 	ReconcileCacheBaseName           string
@@ -496,6 +500,19 @@ func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 		}
 
 		if entry.kind == utils.SnippetsFilterKind {
+			snippetsOrder := make([]string, 0)
+			snippetsSet := make(map[string]struct{})
+			addSnippet := func(name string) {
+				if name == "" {
+					return
+				}
+				if _, ok := snippetsSet[name]; ok {
+					return
+				}
+				snippetsSet[name] = struct{}{}
+				snippetsOrder = append(snippetsOrder, name)
+			}
+
 			ingressClass := r.getIngressClass(ingress)
 			for _, mapping := range r.IngressClassSnippetsFilters {
 				if mapping.Pattern == "" {
@@ -506,9 +523,53 @@ func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 					logger.Error(err, "invalid ingress class pattern for snippets filter", "pattern", mapping.Pattern)
 					continue
 				}
-				if !matched {
+				if matched {
+					addSnippet(mapping.Name)
+				}
+			}
+			for _, mapping := range r.IngressNameSnippetsFilters {
+				if mapping.Pattern == "" {
 					continue
 				}
+				matched, err := filepath.Match(mapping.Pattern, ingress.Name)
+				if err != nil {
+					logger.Error(err, "invalid ingress name pattern for snippets filter", "pattern", mapping.Pattern)
+					continue
+				}
+				if matched {
+					addSnippet(mapping.Name)
+				}
+			}
+			for _, name := range utils.ParseCommaSeparatedAnnotation(ingress.Annotations, HTTPRouteSnippetsFilterAnnotation) {
+				addSnippet(name)
+			}
+
+			for _, name := range utils.MatchIngressAnnotationSnippetsRules(
+				ingress.Annotations,
+				r.IngressAnnotationSnippetsAdd,
+			) {
+				addSnippet(name)
+			}
+			removeSet := make(map[string]struct{})
+			for _, name := range utils.MatchIngressAnnotationSnippetsRules(
+				ingress.Annotations,
+				r.IngressAnnotationSnippetsRemove,
+			) {
+				removeSet[name] = struct{}{}
+			}
+			if len(removeSet) > 0 && len(snippetsOrder) > 0 {
+				filtered := make([]string, 0, len(snippetsOrder))
+				for _, name := range snippetsOrder {
+					if _, ok := removeSet[name]; ok {
+						delete(snippetsSet, name)
+						continue
+					}
+					filtered = append(filtered, name)
+				}
+				snippetsOrder = filtered
+			}
+
+			for _, name := range snippetsOrder {
 				ok, err := utils.EnsureSnippetsFilterCopyForHTTPRoute(
 					ctx,
 					r.Client,
@@ -517,17 +578,17 @@ func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 					httpRoute.Namespace,
 					ingress.Namespace,
 					ingress.Name,
-					mapping.Name,
+					name,
 					httpRoute.Name,
 				)
 				if err != nil {
-					logger.Error(err, "failed to apply class-based SnippetsFilter copy", "name", mapping.Name, "namespace", ingress.Namespace)
+					logger.Error(err, "failed to apply SnippetsFilter copy", "name", name, "namespace", ingress.Namespace)
 					r.recordWarning(ingress, "SnippetsFilterCopyFailed",
-						fmt.Sprintf("failed to copy SnippetsFilter %s from %s", mapping.Name, r.GatewayNamespace))
+						fmt.Sprintf("failed to copy SnippetsFilter %s from %s", name, r.GatewayNamespace))
 					continue
 				}
 				if ok {
-					utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, mapping.Name)
+					utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, name)
 				}
 			}
 
@@ -991,44 +1052,58 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		b = b.WithEventFilter(NamespaceFilter(r.WatchNamespace))
 	}
 
-	snippetsGVK := utils.SnippetsFilterGVK()
-	snippets := &unstructured.Unstructured{}
-	snippets.SetGroupVersionKind(snippetsGVK)
-	b = b.Watches(
-		snippets,
-		handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-			return r.enqueueIngressesForSnippetsFilter(ctx, obj)
-		}),
-		ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-			return obj.GetNamespace() == r.GatewayNamespace
-		})),
-	)
+	apiReader := mgr.GetAPIReader()
+	ctx := context.Background()
+	if version, ok, err := utils.GetCRDVersion(ctx, apiReader, utils.SnippetsFilterCRDName); err == nil && ok {
+		snippetsGVK := schema.GroupVersionKind{Group: utils.NginxGatewayGroup, Version: version, Kind: utils.SnippetsFilterKind}
+		snippets := &unstructured.Unstructured{}
+		snippets.SetGroupVersionKind(snippetsGVK)
+		b = b.Watches(
+			snippets,
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return r.enqueueIngressesForSnippetsFilter(ctx, obj)
+			}),
+			ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				return obj.GetNamespace() == r.GatewayNamespace
+			})),
+		)
+	} else {
+		log.FromContext(ctx).V(1).Info("SnippetsFilter CRD not installed, skipping watch")
+	}
 
-	authGVK := utils.ExtensionFilterGVK(utils.AuthenticationFilterKind, utils.AuthenticationFilterCRDName)
-	auth := &unstructured.Unstructured{}
-	auth.SetGroupVersionKind(authGVK)
-	b = b.Watches(
-		auth,
-		handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-			return r.enqueueIngressesForExtension(ctx, obj, HTTPRouteAuthenticationAnnotation)
-		}),
-		ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-			return obj.GetNamespace() == r.GatewayNamespace
-		})),
-	)
+	if version, ok, err := utils.GetCRDVersion(ctx, apiReader, utils.AuthenticationFilterCRDName); err == nil && ok {
+		authGVK := schema.GroupVersionKind{Group: utils.NginxGatewayGroup, Version: version, Kind: utils.AuthenticationFilterKind}
+		auth := &unstructured.Unstructured{}
+		auth.SetGroupVersionKind(authGVK)
+		b = b.Watches(
+			auth,
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return r.enqueueIngressesForExtension(ctx, obj, HTTPRouteAuthenticationAnnotation)
+			}),
+			ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				return obj.GetNamespace() == r.GatewayNamespace
+			})),
+		)
+	} else {
+		log.FromContext(ctx).V(1).Info("AuthenticationFilter CRD not installed, skipping watch")
+	}
 
-	headerGVK := utils.ExtensionFilterGVK(utils.RequestHeaderModifierFilterKind, utils.RequestHeaderModifierCRDName)
-	header := &unstructured.Unstructured{}
-	header.SetGroupVersionKind(headerGVK)
-	b = b.Watches(
-		header,
-		handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-			return r.enqueueIngressesForExtension(ctx, obj, HTTPRouteRequestHeaderAnnotation)
-		}),
-		ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-			return obj.GetNamespace() == r.GatewayNamespace
-		})),
-	)
+	if version, ok, err := utils.GetCRDVersion(ctx, apiReader, utils.RequestHeaderModifierCRDName); err == nil && ok {
+		headerGVK := schema.GroupVersionKind{Group: utils.NginxGatewayGroup, Version: version, Kind: utils.RequestHeaderModifierFilterKind}
+		header := &unstructured.Unstructured{}
+		header.SetGroupVersionKind(headerGVK)
+		b = b.Watches(
+			header,
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return r.enqueueIngressesForExtension(ctx, obj, HTTPRouteRequestHeaderAnnotation)
+			}),
+			ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				return obj.GetNamespace() == r.GatewayNamespace
+			})),
+		)
+	} else {
+		log.FromContext(ctx).V(1).Info("RequestHeaderModifierFilter CRD not installed, skipping watch")
+	}
 
 	return b.Complete(r)
 }
@@ -1103,6 +1178,40 @@ func (r *IngressReconciler) enqueueIngressesForSnippetsName(ctx context.Context,
 				continue
 			}
 			if !matched {
+				continue
+			}
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: ingress.Namespace,
+					Name:      ingress.Name,
+				},
+			})
+			break
+		}
+		for _, mapping := range r.IngressNameSnippetsFilters {
+			if mapping.Pattern == "" || mapping.Name != filterName {
+				continue
+			}
+			matched, err := filepath.Match(mapping.Pattern, ingress.Name)
+			if err != nil {
+				continue
+			}
+			if !matched {
+				continue
+			}
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: ingress.Namespace,
+					Name:      ingress.Name,
+				},
+			})
+			break
+		}
+		for _, name := range utils.MatchIngressAnnotationSnippetsRules(
+			ingress.Annotations,
+			r.IngressAnnotationSnippetsAdd,
+		) {
+			if name != filterName {
 				continue
 			}
 			requests = append(requests, reconcile.Request{

@@ -67,6 +67,9 @@ func main() {
 	var gatewayAnnotationFilters string
 	var httpRouteAnnotationFilters string
 	var ingressClassSnippetsFilters string
+	var ingressNameSnippetsFilters string
+	var ingressAnnotationSnippetsAdd string
+	var ingressAnnotationSnippetsRemove string
 	var useIngress2Gateway bool
 	var ingressClassFilter string
 	var verbosity int
@@ -93,6 +96,15 @@ func main() {
 	flag.StringVar(&ingressClassSnippetsFilters, "ingress-class-snippets-filter", "",
 		"Comma-separated list of pattern:snippetsFilterName entries. "+
 			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
+	flag.StringVar(&ingressNameSnippetsFilters, "ingress-name-snippets-filter", "",
+		"Comma-separated list of pattern:snippetsFilterName entries. "+
+			"If ingress name matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
+	flag.StringVar(&ingressAnnotationSnippetsAdd, "ingress-annotation-snippets-add", "",
+		"Semicolon-separated list of key=value:filter1,filter2 entries. "+
+			"If annotation value matches glob, add SnippetsFilter(s).")
+	flag.StringVar(&ingressAnnotationSnippetsRemove, "ingress-annotation-snippets-remove", "",
+		"Semicolon-separated list of key=value:filter1,filter2 entries. "+
+			"If annotation value matches glob, remove SnippetsFilter(s).")
 	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",
 		"ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,"+
 			"kubectl.kubernetes.io,kubernetes.io/ingress.class,ingress-doperator.fiction.si",
@@ -130,6 +142,21 @@ func main() {
 	parsedSnippetsFilters, err := utils.ParseIngressClassSnippetsFilters(ingressClassSnippetsFilters)
 	if err != nil {
 		setupLog.Error(err, "Invalid ingress-class-snippets-filter value")
+		os.Exit(1)
+	}
+	parsedNameSnippetsFilters, err := utils.ParseIngressClassSnippetsFilters(ingressNameSnippetsFilters)
+	if err != nil {
+		setupLog.Error(err, "Invalid ingress-name-snippets-filter value")
+		os.Exit(1)
+	}
+	parsedAnnotationAddRules, err := utils.ParseIngressAnnotationSnippetsRules(ingressAnnotationSnippetsAdd)
+	if err != nil {
+		setupLog.Error(err, "Invalid ingress-annotation-snippets-add value")
+		os.Exit(1)
+	}
+	parsedAnnotationRemoveRules, err := utils.ParseIngressAnnotationSnippetsRules(ingressAnnotationSnippetsRemove)
+	if err != nil {
+		setupLog.Error(err, "Invalid ingress-annotation-snippets-remove value")
 		os.Exit(1)
 	}
 
@@ -210,11 +237,14 @@ func main() {
 
 	// Register webhook
 	mutator := &webhookhandler.IngressMutator{
-		Client:                      mgr.GetClient(),
-		Scheme:                      mgr.GetScheme(),
-		Translator:                  trans,
-		IngressClassFilter:          ingressClassFilter,
-		IngressClassSnippetsFilters: parsedSnippetsFilters,
+		Client:                          mgr.GetClient(),
+		Scheme:                          mgr.GetScheme(),
+		Translator:                      trans,
+		IngressClassFilter:              ingressClassFilter,
+		IngressClassSnippetsFilters:     parsedSnippetsFilters,
+		IngressNameSnippetsFilters:      parsedNameSnippetsFilters,
+		IngressAnnotationSnippetsAdd:    parsedAnnotationAddRules,
+		IngressAnnotationSnippetsRemove: parsedAnnotationRemoveRules,
 		HTTPRouteManager: &utils.HTTPRouteManager{
 			Client: mgr.GetClient(),
 		},

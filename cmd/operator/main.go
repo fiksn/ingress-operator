@@ -103,6 +103,9 @@ func main() {
 	var privateIngressClassPattern string
 	var ingressClassFilter string
 	var ingressClassSnippetsFilters string
+	var ingressNameSnippetsFilters string
+	var ingressAnnotationSnippetsAdd string
+	var ingressAnnotationSnippetsRemove string
 	var reconcileCachePersist bool
 	var reconcileCacheMaxEntries int
 	var useIngress2Gateway bool
@@ -147,6 +150,15 @@ func main() {
 	flag.StringVar(&ingressClassSnippetsFilters, "ingress-class-snippets-filter", "",
 		"Comma-separated list of pattern:snippetsFilterName entries. "+
 			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
+	flag.StringVar(&ingressNameSnippetsFilters, "ingress-name-snippets-filter", "",
+		"Comma-separated list of pattern:snippetsFilterName entries. "+
+			"If ingress name matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
+	flag.StringVar(&ingressAnnotationSnippetsAdd, "ingress-annotation-snippets-add", "",
+		"Semicolon-separated list of key=value:filter1,filter2 entries. "+
+			"If annotation value matches glob, add SnippetsFilter(s).")
+	flag.StringVar(&ingressAnnotationSnippetsRemove, "ingress-annotation-snippets-remove", "",
+		"Semicolon-separated list of key=value:filter1,filter2 entries. "+
+			"If annotation value matches glob, remove SnippetsFilter(s).")
 	flag.BoolVar(&reconcileCachePersist, "reconcile-cache-persist", true,
 		"If false, do not persist the reconcile cache to ConfigMaps.")
 	flag.IntVar(&reconcileCacheMaxEntries, "reconcile-cache-max-entries", 0,
@@ -197,6 +209,21 @@ func main() {
 	parsedSnippetsFilters, err := utils.ParseIngressClassSnippetsFilters(ingressClassSnippetsFilters)
 	if err != nil {
 		setupLog.Error(err, "Invalid ingress-class-snippets-filter value")
+		os.Exit(1)
+	}
+	parsedNameSnippetsFilters, err := utils.ParseIngressClassSnippetsFilters(ingressNameSnippetsFilters)
+	if err != nil {
+		setupLog.Error(err, "Invalid ingress-name-snippets-filter value")
+		os.Exit(1)
+	}
+	parsedAnnotationAddRules, err := utils.ParseIngressAnnotationSnippetsRules(ingressAnnotationSnippetsAdd)
+	if err != nil {
+		setupLog.Error(err, "Invalid ingress-annotation-snippets-add value")
+		os.Exit(1)
+	}
+	parsedAnnotationRemoveRules, err := utils.ParseIngressAnnotationSnippetsRules(ingressAnnotationSnippetsRemove)
+	if err != nil {
+		setupLog.Error(err, "Invalid ingress-annotation-snippets-remove value")
 		os.Exit(1)
 	}
 
@@ -412,6 +439,9 @@ func main() {
 		PrivateIngressClassPattern:       privateIngressClassPattern,
 		IngressClassFilter:               ingressClassFilter,
 		IngressClassSnippetsFilters:      parsedSnippetsFilters,
+		IngressNameSnippetsFilters:       parsedNameSnippetsFilters,
+		IngressAnnotationSnippetsAdd:     parsedAnnotationAddRules,
+		IngressAnnotationSnippetsRemove:  parsedAnnotationRemoveRules,
 		ReconcileCache:                   reconcileCache,
 		ReconcileCacheNamespace:          gatewayNamespace,
 		ReconcileCacheBaseName:           utils.ReconcileCacheConfigMapBaseName,

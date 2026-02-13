@@ -44,6 +44,13 @@ const (
 	IngressClassAnnotation   = "kubernetes.io/ingress.class"
 	ReferenceGrantName       = "ingress-doperator-gateway-secrets"
 	MaxK8sNameLength         = 253 // Kubernetes resource name max length
+
+	RequestHeaderAddAnnotation     = "ingress-doperator.fiction.si/request-header-add"
+	RequestHeaderSetAnnotation     = "ingress-doperator.fiction.si/request-header-set"
+	RequestHeaderRemoveAnnotation  = "ingress-doperator.fiction.si/request-header-remove"
+	ResponseHeaderAddAnnotation    = "ingress-doperator.fiction.si/response-header-add"
+	ResponseHeaderSetAnnotation    = "ingress-doperator.fiction.si/response-header-set"
+	ResponseHeaderRemoveAnnotation = "ingress-doperator.fiction.si/response-header-remove"
 )
 
 // Config holds configuration for the translator
@@ -671,6 +678,8 @@ func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewa
 	}
 	httpRoute.Spec.ParentRefs = parentRefs
 
+	requestHeaderFilter, responseHeaderFilter := buildHeaderModifierFilters(ingress.Annotations)
+
 	// Convert Ingress rules to HTTPRoute rules
 	var rules []gatewayv1.HTTPRouteRule
 	for _, rule := range ingress.Spec.Rules {
@@ -732,6 +741,12 @@ func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewa
 					Matches:     matches,
 					BackendRefs: backendRefs,
 				}
+				if requestHeaderFilter != nil {
+					httpRouteRule.Filters = append(httpRouteRule.Filters, *requestHeaderFilter)
+				}
+				if responseHeaderFilter != nil {
+					httpRouteRule.Filters = append(httpRouteRule.Filters, *responseHeaderFilter)
+				}
 				rules = append(rules, httpRouteRule)
 			}
 		}
@@ -739,6 +754,100 @@ func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewa
 	httpRoute.Spec.Rules = rules
 
 	return httpRoute
+}
+
+func buildHeaderModifierFilters(annotations map[string]string) (*gatewayv1.HTTPRouteFilter, *gatewayv1.HTTPRouteFilter) {
+	if annotations == nil {
+		return nil, nil
+	}
+
+	requestAdd := parseHeaderNameValueList(annotations[RequestHeaderAddAnnotation])
+	requestSet := parseHeaderNameValueList(annotations[RequestHeaderSetAnnotation])
+	requestRemove := parseHeaderNameList(annotations[RequestHeaderRemoveAnnotation])
+	responseAdd := parseHeaderNameValueList(annotations[ResponseHeaderAddAnnotation])
+	responseSet := parseHeaderNameValueList(annotations[ResponseHeaderSetAnnotation])
+	responseRemove := parseHeaderNameList(annotations[ResponseHeaderRemoveAnnotation])
+
+	var requestFilter *gatewayv1.HTTPRouteFilter
+	if len(requestAdd) > 0 || len(requestSet) > 0 || len(requestRemove) > 0 {
+		requestFilter = &gatewayv1.HTTPRouteFilter{
+			Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+			RequestHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+				Add:    requestAdd,
+				Set:    requestSet,
+				Remove: requestRemove,
+			},
+		}
+	}
+
+	var responseFilter *gatewayv1.HTTPRouteFilter
+	if len(responseAdd) > 0 || len(responseSet) > 0 || len(responseRemove) > 0 {
+		responseFilter = &gatewayv1.HTTPRouteFilter{
+			Type: gatewayv1.HTTPRouteFilterResponseHeaderModifier,
+			ResponseHeaderModifier: &gatewayv1.HTTPHeaderFilter{
+				Add:    responseAdd,
+				Set:    responseSet,
+				Remove: responseRemove,
+			},
+		}
+	}
+
+	return requestFilter, responseFilter
+}
+
+func parseHeaderNameList(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{})
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+func parseHeaderNameValueList(raw string) []gatewayv1.HTTPHeader {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]gatewayv1.HTTPHeader, 0, len(parts))
+	seen := make(map[string]struct{})
+	for _, part := range parts {
+		entry := strings.TrimSpace(part)
+		if entry == "" {
+			continue
+		}
+		kv := strings.SplitN(entry, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(kv[0])
+		value := strings.TrimSpace(kv[1])
+		if name == "" {
+			continue
+		}
+		key := name + "\x00" + value
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, gatewayv1.HTTPHeader{
+			Name:  gatewayv1.HTTPHeaderName(name),
+			Value: value,
+		})
+	}
+	return out
 }
 
 func isValidHostname(hostname string) bool {
