@@ -713,7 +713,7 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 
 	if !r.EnableDeletion {
 		logger.V(1).Info("Deletion disabled - HTTPRoute and Gateway will not be deleted")
-		return r.finalizeDeletion(ctx, ingress, nil)
+		return r.finalizeDeletion(ctx, ingress)
 	}
 
 	if err := r.deleteManagedHTTPRoutes(ctx, ingress, logger); err != nil {
@@ -730,7 +730,7 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 		}
 	}
 
-	return r.finalizeDeletion(ctx, ingress, nil)
+	return r.finalizeDeletion(ctx, ingress)
 }
 
 func (r *IngressReconciler) shouldSkipDeletionCleanup(
@@ -742,7 +742,7 @@ func (r *IngressReconciler) shouldSkipDeletionCleanup(
 		logger.Info("Ingress deleted by ingress-doperator, skipping derived resource cleanup",
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
-		_, _ = r.finalizeDeletion(ctx, ingress, nil)
+		_, _ = r.finalizeDeletion(ctx, ingress)
 		return true
 	}
 
@@ -750,7 +750,7 @@ func (r *IngressReconciler) shouldSkipDeletionCleanup(
 		logger.Info("Ingress deleted by ingress-doperator (cached), skipping derived resource cleanup",
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
-		_, _ = r.finalizeDeletion(ctx, ingress, nil)
+		_, _ = r.finalizeDeletion(ctx, ingress)
 		return true
 	}
 
@@ -864,11 +864,7 @@ func (r *IngressReconciler) cleanupSharedGateway(
 func (r *IngressReconciler) finalizeDeletion(
 	ctx context.Context,
 	ingress *networkingv1.Ingress,
-	err error,
 ) (ctrl.Result, error) {
-	if err != nil {
-		return ctrl.Result{}, err
-	}
 	if removeErr := r.removeFinalizer(ctx, ingress); removeErr != nil {
 		log.FromContext(ctx).Error(removeErr, "failed to remove finalizer")
 		return ctrl.Result{}, removeErr
