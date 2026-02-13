@@ -82,6 +82,7 @@ const (
 )
 
 const requeueAfterError = 30 * time.Second
+const selfDeletedIngressTTL = 10 * time.Minute
 
 type IngressReconciler struct {
 	client.Client
@@ -119,6 +120,8 @@ type IngressReconciler struct {
 	ReconcileCacheShards             int
 	ReconcileCachePersist            bool
 	ReconcileCacheMaxEntries         int
+	SelfDeletedIngresses             map[string]time.Time
+	SelfDeletedIngressesMu           sync.Mutex
 	reconcileCacheMu                 sync.Mutex
 	errorLogMu                       sync.Mutex
 	errorLogLast                     map[string]time.Time
@@ -189,11 +192,27 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
+	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
+		logger.Info("Ingress marked for removal by ingress-doperator, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("removed", ingress.Namespace, ingress.Name).Inc()
+		return ctrl.Result{}, nil
+	}
+
 	if r.getIngressClass(&ingress) == DisabledIngressClassName {
 		logger.Info("Ingress uses disabled class, skipping reconciliation",
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
 		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled-class", ingress.Namespace, ingress.Name).Inc()
+		return ctrl.Result{}, nil
+	}
+
+	if r.wasSelfDeleted(&ingress) {
+		logger.Info("Ingress was deleted by ingress-doperator, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("self-deleted", ingress.Namespace, ingress.Name).Inc()
 		return ctrl.Result{}, nil
 	}
 
@@ -684,6 +703,30 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 	logger := log.FromContext(ctx)
 	logger.V(1).Info("Handling Ingress deletion", "namespace", ingress.Namespace, "name", ingress.Name)
 
+	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
+		logger.Info("Ingress deleted by ingress-doperator, skipping derived resource cleanup",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		err := r.removeFinalizer(ctx, ingress)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		r.evictReconcileCache(ingress)
+		return ctrl.Result{}, nil
+	}
+
+	if r.wasSelfDeleted(ingress) {
+		logger.Info("Ingress deleted by ingress-doperator (cached), skipping derived resource cleanup",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		err := r.removeFinalizer(ctx, ingress)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		r.evictReconcileCache(ingress)
+		return ctrl.Result{}, nil
+	}
+
 	if !r.EnableDeletion {
 		// Deletion is disabled, just remove finalizer
 		err := r.removeFinalizer(ctx, ingress)
@@ -855,6 +898,40 @@ func (r *IngressReconciler) evictOldestCacheEntries() {
 	}
 }
 
+func (r *IngressReconciler) markSelfDeleted(ingress *networkingv1.Ingress) {
+	if ingress == nil || ingress.UID == "" {
+		return
+	}
+	r.SelfDeletedIngressesMu.Lock()
+	defer r.SelfDeletedIngressesMu.Unlock()
+	if r.SelfDeletedIngresses == nil {
+		r.SelfDeletedIngresses = make(map[string]time.Time)
+	}
+	r.SelfDeletedIngresses[string(ingress.UID)] = time.Now()
+}
+
+func (r *IngressReconciler) wasSelfDeleted(ingress *networkingv1.Ingress) bool {
+	if ingress == nil || ingress.UID == "" {
+		return false
+	}
+	r.SelfDeletedIngressesMu.Lock()
+	defer r.SelfDeletedIngressesMu.Unlock()
+	if r.SelfDeletedIngresses == nil {
+		return false
+	}
+	cutoff := time.Now().Add(-selfDeletedIngressTTL)
+	for uid, ts := range r.SelfDeletedIngresses {
+		if ts.Before(cutoff) {
+			delete(r.SelfDeletedIngresses, uid)
+		}
+	}
+	ts, ok := r.SelfDeletedIngresses[string(ingress.UID)]
+	if !ok {
+		return false
+	}
+	return ts.After(cutoff)
+}
+
 func (r *IngressReconciler) removeFinalizer(ctx context.Context, ingress *networkingv1.Ingress) error {
 	if utils.ContainsString(ingress.Finalizers, FinalizerName) {
 		ingress.Finalizers = utils.RemoveString(ingress.Finalizers, FinalizerName)
@@ -997,6 +1074,7 @@ func (r *IngressReconciler) removeIngress(ctx context.Context, ingress *networki
 	// Check if already marked for removal to avoid re-deletion
 	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
 		logger.Info("Ingress already marked for removal, proceeding with deletion")
+		r.markSelfDeleted(ingress)
 		// Delete the Ingress resource
 		if err := r.Delete(ctx, ingress); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -1021,6 +1099,8 @@ func (r *IngressReconciler) removeIngress(ctx context.Context, ingress *networki
 		return fmt.Errorf("failed to mark Ingress for removal: %w", err)
 	}
 	logger.Info("Marked source Ingress for removal", "namespace", ingress.Namespace, "name", ingress.Name)
+
+	r.markSelfDeleted(ingress)
 
 	// Delete the Ingress resource
 	if err := r.Delete(ctx, ingress); err != nil {
