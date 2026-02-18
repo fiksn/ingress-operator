@@ -617,13 +617,13 @@ func splitCSV(raw string) []string {
 	return strings.Split(raw, ",")
 }
 
-func appendFilterIfMissing(filters []string, value string) []string {
-	for _, item := range filters {
+func appendFilterIfMissing(filterList []string, value string) []string {
+	for _, item := range filterList {
 		if strings.TrimSpace(item) == value {
-			return filters
+			return filterList
 		}
 	}
-	return append(filters, value)
+	return append(filterList, value)
 }
 
 func parseKeyValueCSV(raw string) map[string]string {
