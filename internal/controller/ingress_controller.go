@@ -197,7 +197,8 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Handle source Ingress based on configured mode
-	switch r.IngressPostProcessingMode {
+	effectiveMode := r.resolveIngressPostProcessingMode(&ingress)
+	switch effectiveMode {
 	case IngressPostProcessingModeRemove:
 		if err := r.removeIngress(ctx, &ingress); err != nil {
 			logger.Error(err, "failed to remove source Ingress")
@@ -223,8 +224,8 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
 	}
 
-	disableAfterReconcile := r.IngressPostProcessingMode == IngressPostProcessingModeDisable
-	disableExternalDNSAfterReconcile := r.IngressPostProcessingMode == IngressPostProcessingModeDisableExternalDNS
+	disableAfterReconcile := effectiveMode == IngressPostProcessingModeDisable
+	disableExternalDNSAfterReconcile := effectiveMode == IngressPostProcessingModeDisableExternalDNS
 	if r.OneGatewayPerIngress {
 		// Mode: One Gateway per Ingress
 		result, ok := r.reconcileOneGatewayPerIngress(ctx, ingressList.Items)
@@ -290,14 +291,6 @@ func (r *IngressReconciler) shouldSkipIngress(
 		return true
 	}
 
-	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] != "" {
-		logger.V(1).Info("Ingress is disabled, skipping reconciliation",
-			"namespace", ingress.Namespace,
-			"name", ingress.Name)
-		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled", ingress.Namespace, ingress.Name).Inc()
-		return true
-	}
-
 	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
 		logger.Info("Ingress marked for removal by ingress-doperator, skipping reconciliation",
 			"namespace", ingress.Namespace,
@@ -332,6 +325,22 @@ func (r *IngressReconciler) shouldSkipIngress(
 	}
 
 	return false
+}
+
+func (r *IngressReconciler) resolveIngressPostProcessingMode(
+	ingress *networkingv1.Ingress,
+) IngressPostProcessingMode {
+	if ingress == nil || ingress.Annotations == nil {
+		return r.IngressPostProcessingMode
+	}
+	switch ingress.Annotations[IngressDisabledAnnotation] {
+	case IngressDisabledReasonNormal:
+		return IngressPostProcessingModeDisable
+	case IngressDisabledReasonExternalDNS:
+		return IngressPostProcessingModeDisableExternalDNS
+	default:
+		return r.IngressPostProcessingMode
+	}
 }
 func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 	ctx context.Context,

@@ -82,6 +82,7 @@ func main() {
 	var restoreClass trackedBool
 	var restoreExternalDNS trackedBool
 	var dangerouslyDeleteIngresses bool
+	var preventFurtherReconciliation bool
 
 	flag.StringVar(&namespace, "namespace", "", "If set, only process Ingresses in this namespace")
 	flag.BoolVar(&removeDerivedResources, "remove-derived-resources", false,
@@ -95,6 +96,8 @@ func main() {
 		"If true, restore external-dns annotations saved by ingress-doperator")
 	flag.BoolVar(&dangerouslyDeleteIngresses, "dangerously-delete-ingresses", false,
 		"If true, delete disabled Ingresses managed by ingress-doperator")
+	flag.BoolVar(&preventFurtherReconciliation, "prevent-further-reconciliation", false,
+		"If true, mark restored Ingresses as disabled to stop future reconciles")
 	flag.IntVar(&verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
 	opts := zap.Options{
 		Development: true,
@@ -154,6 +157,7 @@ func main() {
 		restoreClass.value,
 		restoreExternalDNS.value,
 		dangerouslyDeleteIngresses,
+		preventFurtherReconciliation,
 	); err != nil {
 		setupLog.Error(err, "reenabler failed")
 		os.Exit(1)
@@ -168,12 +172,14 @@ func runReenabler(
 	restoreClass bool,
 	restoreExternalDNS bool,
 	dangerouslyDeleteIngresses bool,
+	preventFurtherReconciliation bool,
 ) error {
 	opts := reenablerOptions{
-		removeDerivedResources:     removeDerivedResources,
-		restoreClass:               restoreClass,
-		restoreExternalDNS:         restoreExternalDNS,
-		dangerouslyDeleteIngresses: dangerouslyDeleteIngresses,
+		removeDerivedResources:       removeDerivedResources,
+		restoreClass:                 restoreClass,
+		restoreExternalDNS:           restoreExternalDNS,
+		dangerouslyDeleteIngresses:   dangerouslyDeleteIngresses,
+		preventFurtherReconciliation: preventFurtherReconciliation,
 	}
 
 	ingresses, err := listIngresses(ctx, cli, namespace)
@@ -202,10 +208,11 @@ func runReenabler(
 }
 
 type reenablerOptions struct {
-	removeDerivedResources     bool
-	restoreClass               bool
-	restoreExternalDNS         bool
-	dangerouslyDeleteIngresses bool
+	removeDerivedResources       bool
+	restoreClass                 bool
+	restoreExternalDNS           bool
+	dangerouslyDeleteIngresses   bool
+	preventFurtherReconciliation bool
 }
 
 func listIngresses(ctx context.Context, cli client.Client, namespace string) ([]networkingv1.Ingress, error) {
@@ -265,6 +272,11 @@ func processIngress(
 	if err := restoreIngressState(ctx, cli, ingress, disabled && opts.restoreClass, opts.restoreExternalDNS); err != nil {
 		return err
 	}
+	if opts.preventFurtherReconciliation && (opts.restoreClass || opts.restoreExternalDNS) {
+		if err := markIngressDisabled(ctx, cli, ingress, opts.restoreClass); err != nil {
+			return err
+		}
+	}
 	if disabled && opts.restoreClass && opts.removeDerivedResources {
 		if err := removeManagedHTTPRoutes(ctx, manager, ingress); err != nil {
 			return err
@@ -290,6 +302,27 @@ func processIngress(
 			"name", ingress.Name)
 	}
 	return nil
+}
+
+func markIngressDisabled(
+	ctx context.Context,
+	cli client.Client,
+	ingress *networkingv1.Ingress,
+	useNormal bool,
+) error {
+	if ingress == nil {
+		return nil
+	}
+	updated := ingress.DeepCopy()
+	if updated.Annotations == nil {
+		updated.Annotations = map[string]string{}
+	}
+	if useNormal {
+		updated.Annotations[controller.IngressDisabledAnnotation] = controller.IngressDisabledReasonNormal
+	} else {
+		updated.Annotations[controller.IngressDisabledAnnotation] = controller.IngressDisabledReasonExternalDNS
+	}
+	return cli.Update(ctx, updated)
 }
 
 func deleteIngressIfEligible(
