@@ -76,6 +76,10 @@ const (
 	whitelistSourceRangeKey  = "whitelist-source-range"
 	denylistSourceRangeKey   = "denylist-source-range"
 	blacklistSourceRangeKey  = "blacklist-source-range"
+	customHTTPErrorsKey      = "custom-http-errors"
+	fromToWWWRedirectKey     = "from-to-www-redirect"
+	rewriteTargetKey         = "rewrite-target"
+	useRegexKey              = "use-regex"
 )
 
 var nginxIngressDirectiveWhitelist = map[string]struct{}{
@@ -182,6 +186,52 @@ func parseSSLProxyHeaders(raw string) ([]sslProxyHeader, []string) {
 	}
 
 	return headers, warnings
+}
+
+func parseCustomHTTPErrors(raw string) ([]string, []string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(parts))
+	warnings := make([]string, 0, 1)
+
+	for _, part := range parts {
+		code := strings.TrimSpace(part)
+		if code == "" {
+			continue
+		}
+		if len(code) != 3 {
+			warnings = append(warnings, fmt.Sprintf("custom-http-errors code %q is not a 3-digit HTTP status", code))
+			continue
+		}
+		for _, r := range code {
+			if r < '0' || r > '9' {
+				warnings = append(warnings, fmt.Sprintf("custom-http-errors code %q is not a 3-digit HTTP status", code))
+				code = ""
+				break
+			}
+		}
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+
+	if len(out) == 0 {
+		warnings = append(warnings, "custom-http-errors has no valid HTTP status codes")
+	}
+	if len(out) > 1 {
+		warnings = append(warnings, "custom-http-errors supports multiple codes, but the snippet error handler returns the first code only")
+	}
+
+	return out, warnings
 }
 
 type crdVersionCacheEntry struct {
@@ -396,6 +446,9 @@ type nginxIngressSnippetState struct {
 	sslProxyHeaders       []sslProxyHeader
 	whitelistSourceRanges []string
 	blacklistSourceRanges []string
+	customHTTPErrors      []string
+	rewriteTarget         string
+	useRegex              bool
 	warnings              []string
 }
 
@@ -483,6 +536,28 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 			state.preserveTrailingSlash = true
 		}
 		return true
+	case customHTTPErrorsKey:
+		codes, warnings := parseCustomHTTPErrors(value)
+		if len(codes) > 0 {
+			state.customHTTPErrors = codes
+		}
+		if len(warnings) > 0 {
+			state.warnings = append(state.warnings, warnings...)
+		}
+		return true
+	case fromToWWWRedirectKey:
+		if strings.EqualFold(value, "true") {
+			state.warnings = append(state.warnings, "from-to-www-redirect is not supported in snippets; missing host information, annotation ignored")
+		}
+		return true
+	case rewriteTargetKey:
+		state.rewriteTarget = value
+		return true
+	case useRegexKey:
+		if strings.EqualFold(value, "true") {
+			state.useRegex = true
+		}
+		return true
 	default:
 		return false
 	}
@@ -526,6 +601,10 @@ func buildNginxDirectiveLines(state nginxIngressSnippetState) ([]string, []strin
 	lines := append([]string{}, state.lines...)
 	warnings := append([]string{}, state.warnings...)
 
+	if strings.TrimSpace(state.rewriteTarget) != "" && strings.Contains(state.rewriteTarget, "$") && !state.useRegex {
+		warnings = append(warnings, "rewrite-target contains capture references but use-regex is not enabled")
+	}
+
 	if state.clientMaxBodySize != "" {
 		lines = append(lines, fmt.Sprintf("client_max_body_size %s;", state.clientMaxBodySize))
 	} else if state.proxyBodySizeValue != "" {
@@ -566,6 +645,13 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 	}
 
 	serverLines := append([]string{}, lines...)
+	if len(state.customHTTPErrors) > 0 {
+		serverLines = append(serverLines,
+			"proxy_intercept_errors on;",
+			fmt.Sprintf("error_page %s = @ingress_doperator_custom_error;", strings.Join(state.customHTTPErrors, " ")),
+			fmt.Sprintf("location @ingress_doperator_custom_error {\n    return %s;\n}", state.customHTTPErrors[0]),
+		)
+	}
 	if state.browserXssFilter {
 		serverLines = append(serverLines, "add_header X-XSS-Protection \"1; mode=block\" always;")
 	}
@@ -608,6 +694,14 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 	}
 
 	locationLines := make([]string, 0)
+	if strings.TrimSpace(state.rewriteTarget) != "" {
+		target := strings.TrimSpace(state.rewriteTarget)
+		pattern := "^"
+		if state.useRegex || strings.Contains(target, "$") {
+			pattern = "^(.*)$"
+		}
+		locationLines = append(locationLines, fmt.Sprintf("rewrite %s %s break;", pattern, target))
+	}
 	for _, cidr := range uniqueStrings(state.blacklistSourceRanges) {
 		locationLines = append(locationLines, fmt.Sprintf("deny %s;", cidr))
 	}
